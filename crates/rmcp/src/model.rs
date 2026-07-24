@@ -1113,7 +1113,7 @@ impl schemars::JsonSchema for DiscoverRequestParams {
 pub type DiscoverRequest = Request<DiscoverRequestMethod, DiscoverRequestParams>;
 
 /// The server's response to a [`DiscoverRequest`].
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
@@ -1124,7 +1124,8 @@ pub struct DiscoverResult {
     pub supported_versions: Vec<ProtocolVersion>,
     /// Capabilities provided by this server.
     pub capabilities: ServerCapabilities,
-    /// Information about the server implementation.
+    /// Information about the server implementation. Also accepted from
+    /// `_meta["io.modelcontextprotocol/serverInfo"]` during deserialization.
     pub server_info: Implementation,
     /// Optional guidance for using the server.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1136,6 +1137,53 @@ pub struct DiscoverResult {
     /// Protocol-level response metadata.
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<MetaObject>,
+}
+
+impl<'de> Deserialize<'de> for DiscoverResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Helper {
+            result_type: ResultType,
+            supported_versions: Vec<ProtocolVersion>,
+            capabilities: ServerCapabilities,
+            server_info: Option<Implementation>,
+            instructions: Option<String>,
+            ttl_ms: u64,
+            cache_scope: CacheScope,
+            #[serde(rename = "_meta")]
+            meta: Option<MetaObject>,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+        let server_info = match helper.server_info {
+            Some(server_info) => server_info,
+            None => {
+                let metadata_server_info = helper
+                    .meta
+                    .as_ref()
+                    .and_then(|metadata| metadata.0.get("io.modelcontextprotocol/serverInfo"))
+                    .ok_or_else(|| serde::de::Error::missing_field("serverInfo"))?;
+
+                serde_json::from_value(metadata_server_info.clone())
+                    .map_err(serde::de::Error::custom)?
+            }
+        };
+
+        Ok(Self {
+            result_type: helper.result_type,
+            supported_versions: helper.supported_versions,
+            capabilities: helper.capabilities,
+            server_info,
+            instructions: helper.instructions,
+            ttl_ms: helper.ttl_ms,
+            cache_scope: helper.cache_scope,
+            meta: helper.meta,
+        })
+    }
 }
 
 impl DiscoverResult {
