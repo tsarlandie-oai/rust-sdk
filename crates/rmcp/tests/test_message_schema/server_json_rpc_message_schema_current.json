@@ -756,7 +756,7 @@
           ]
         },
         "serverInfo": {
-          "description": "Information about the server implementation.",
+          "description": "Information about the server implementation. Also accepted from\n`_meta[\"io.modelcontextprotocol/serverInfo\"]` during deserialization.",
           "allOf": [
             {
               "$ref": "#/definitions/Implementation"

@@ -3501,7 +3501,7 @@ pub struct AuthorizationSession {
     pub auth_manager: AuthorizationManager,
     pub auth_url: String,
     pub redirect_uri: String,
-    context: AuthorizationSessionContext,
+    context: Box<AuthorizationSessionContext>,
 }
 
 impl AuthorizationSession {
@@ -3644,7 +3644,7 @@ impl AuthorizationSession {
             auth_manager,
             auth_url,
             redirect_uri,
-            context,
+            context: Box::new(context),
         })
     }
 
@@ -3682,7 +3682,7 @@ impl AuthorizationSession {
             auth_manager,
             auth_url,
             redirect_uri: redirect_uri.to_string(),
-            context,
+            context: Box::new(context),
         }
     }
 
