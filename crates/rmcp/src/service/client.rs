@@ -102,13 +102,18 @@ where
         .ok_or_else(|| ClientInitializeError::ConnectionClosed(context.to_string()))
 }
 
+enum StartupResponse {
+    Response(ServerResult, RequestId),
+    Error(ErrorData, Option<RequestId>),
+}
+
 /// Helper function to expect a response from the stream
 async fn expect_response<T, S>(
     transport: &mut T,
     context: &str,
     service: &S,
     peer: Peer<RoleClient>,
-) -> Result<(ServerResult, RequestId), ClientInitializeError>
+) -> Result<StartupResponse, ClientInitializeError>
 where
     T: Transport<RoleClient>,
     S: Service<RoleClient>,
@@ -118,11 +123,11 @@ where
         match message {
             // Expected message to complete the initialization
             ServerJsonRpcMessage::Response(JsonRpcResponse { id, result, .. }) => {
-                break Ok((result, id));
+                break Ok(StartupResponse::Response(result, id));
             }
             // Handle JSON-RPC error responses
             ServerJsonRpcMessage::Error(error) => {
-                break Err(ClientInitializeError::JsonRpcError(error.error));
+                break Ok(StartupResponse::Error(error.error, error.id));
             }
             // Server could send logging messages before handshake
             ServerJsonRpcMessage::Notification(mut notification) => {
@@ -550,6 +555,127 @@ pub enum ClientLifecycleMode {
     },
 }
 
+#[derive(Debug)]
+struct DiscoverStartupError {
+    error: ClientInitializeError,
+    requested_version: Option<ProtocolVersion>,
+    request_id: Option<RequestId>,
+    response_id: Option<RequestId>,
+}
+
+impl From<ClientInitializeError> for DiscoverStartupError {
+    fn from(error: ClientInitializeError) -> Self {
+        Self {
+            error,
+            requested_version: None,
+            request_id: None,
+            response_id: None,
+        }
+    }
+}
+
+impl DiscoverStartupError {
+    fn json_rpc(
+        error: ErrorData,
+        requested_version: ProtocolVersion,
+        request_id: RequestId,
+        response_id: Option<RequestId>,
+    ) -> Self {
+        Self {
+            error: ClientInitializeError::JsonRpcError(error),
+            requested_version: Some(requested_version),
+            request_id: Some(request_id),
+            response_id,
+        }
+    }
+
+    fn is_legacy_server(&self) -> bool {
+        match &self.error {
+            ClientInitializeError::NoCompatibleProtocolVersion {
+                server_supported, ..
+            } => exclusively_historical_protocol_versions(server_supported),
+            ClientInitializeError::JsonRpcError(error) => {
+                let correlated = self
+                    .request_id
+                    .as_ref()
+                    .zip(self.response_id.as_ref())
+                    .is_some_and(|(request_id, response_id)| {
+                        request_id.matches_response_id(response_id)
+                    });
+
+                if error.code == crate::model::ErrorCode::METHOD_NOT_FOUND {
+                    return correlated;
+                }
+
+                if error.code != crate::model::ErrorCode(-32000)
+                    || self.request_id.is_none()
+                    || (!correlated && self.response_id.is_some())
+                {
+                    return false;
+                }
+
+                let message = error.message.trim().to_ascii_lowercase();
+                let normalized_message = message.strip_prefix("bad request: ").unwrap_or(&message);
+                if normalized_message == "no valid session id provided" {
+                    return true;
+                }
+
+                let Some(requested_version) = &self.requested_version else {
+                    return false;
+                };
+                if !normalized_message.contains("unsupported protocol version")
+                    || !normalized_message.contains(requested_version.as_str())
+                {
+                    return false;
+                }
+
+                let supported = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("supported"))
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<ProtocolVersion>>(value).ok())
+                    .or_else(|| historical_versions_from_message(normalized_message));
+
+                supported
+                    .as_deref()
+                    .is_some_and(exclusively_historical_protocol_versions)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn exclusively_historical_protocol_versions(versions: &[ProtocolVersion]) -> bool {
+    !versions.is_empty()
+        && versions.iter().all(|version| {
+            (ProtocolVersion::KNOWN_VERSIONS.contains(version)
+                && version < &ProtocolVersion::V_2026_07_28)
+                // Some deployed legacy servers also advertise this pre-release version.
+                || version.as_str() == "2024-10-07"
+        })
+}
+
+fn historical_versions_from_message(message: &str) -> Option<Vec<ProtocolVersion>> {
+    let (_, supported_versions) = message.split_once("supported versions:")?;
+    let versions = supported_versions
+        .split(|character: char| !character.is_ascii_digit() && character != '-')
+        .filter(|candidate| {
+            candidate.len() == 10
+                && candidate.as_bytes().get(4) == Some(&b'-')
+                && candidate.as_bytes().get(7) == Some(&b'-')
+        })
+        .filter_map(|candidate| {
+            serde_json::from_value::<ProtocolVersion>(serde_json::Value::String(
+                candidate.to_owned(),
+            ))
+            .ok()
+        })
+        .collect::<Vec<_>>();
+
+    (!versions.is_empty()).then_some(versions)
+}
+
 /// Client-specific lifecycle entry points.
 pub trait ClientServiceExt: Service<RoleClient> + Sized {
     fn serve_with_lifecycle<T, E, A>(
@@ -676,7 +802,8 @@ where
                 &client_info,
                 preferred_versions,
             )
-            .await?;
+            .await
+            .map_err(|error| error.error)?;
         }
         ClientLifecycleMode::Auto {
             preferred_versions,
@@ -693,9 +820,7 @@ where
             .await;
             match discover_result {
                 Ok(()) => {}
-                Err(ClientInitializeError::JsonRpcError(error))
-                    if error.code == crate::model::ErrorCode::METHOD_NOT_FOUND =>
-                {
+                Err(error) if error.is_legacy_server() => {
                     let mut legacy_info = client_info;
                     if let Some(version) = legacy_version {
                         legacy_info.protocol_version = version;
@@ -703,7 +828,7 @@ where
                     legacy_startup(&service, &mut transport, &id_provider, &peer, legacy_info)
                         .await?;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.error),
             }
         }
     }
@@ -739,7 +864,20 @@ where
         })?;
 
     let (response, response_id) =
-        expect_response(transport, "initialize response", service, peer.clone()).await?;
+        match expect_response(transport, "initialize response", service, peer.clone()).await? {
+            StartupResponse::Response(response, response_id) => (response, response_id),
+            StartupResponse::Error(error, response_id) => {
+                if let Some(response_id) = response_id
+                    && !id.matches_response_id(&response_id)
+                {
+                    return Err(ClientInitializeError::ConflictInitResponseId(
+                        id,
+                        response_id,
+                    ));
+                }
+                return Err(ClientInitializeError::JsonRpcError(error));
+            }
+        };
 
     if !id.matches_response_id(&response_id) {
         return Err(ClientInitializeError::ConflictInitResponseId(
@@ -773,13 +911,13 @@ async fn discover_startup<S, T>(
     peer: &Peer<RoleClient>,
     client_info: &ClientInfo,
     preferred_versions: Vec<ProtocolVersion>,
-) -> Result<(), ClientInitializeError>
+) -> Result<(), DiscoverStartupError>
 where
     S: Service<RoleClient>,
     T: Transport<RoleClient> + 'static,
 {
     if preferred_versions.is_empty() {
-        return Err(ClientInitializeError::NoPreferredProtocolVersion);
+        return Err(ClientInitializeError::NoPreferredProtocolVersion.into());
     }
 
     let mut attempted = Vec::new();
@@ -805,13 +943,12 @@ where
                 ClientInitializeError::transport::<T>(error, "send discover request")
             })?;
 
-        match expect_response(transport, "discover response", service, peer.clone()).await {
-            Ok((ServerResult::DiscoverResult(result), response_id)) => {
+        match expect_response(transport, "discover response", service, peer.clone()).await? {
+            StartupResponse::Response(ServerResult::DiscoverResult(result), response_id) => {
                 if !id.matches_response_id(&response_id) {
-                    return Err(ClientInitializeError::ConflictInitResponseId(
-                        id,
-                        response_id,
-                    ));
+                    return Err(
+                        ClientInitializeError::ConflictInitResponseId(id, response_id).into(),
+                    );
                 }
                 let Some(selected) =
                     select_protocol_version(&preferred_versions, &result.supported_versions)
@@ -819,7 +956,8 @@ where
                     return Err(ClientInitializeError::NoCompatibleProtocolVersion {
                         client_supported: preferred_versions,
                         server_supported: result.supported_versions,
-                    });
+                    }
+                    .into());
                 };
                 peer.set_peer_info(ServerInfo {
                     protocol_version: selected.clone(),
@@ -835,12 +973,31 @@ where
                 });
                 return Ok(());
             }
-            Ok((response, _)) => {
-                return Err(ClientInitializeError::ExpectedInitResult(Some(response)));
+            StartupResponse::Response(response, _) => {
+                return Err(ClientInitializeError::ExpectedInitResult(Some(response)).into());
             }
-            Err(ClientInitializeError::JsonRpcError(error))
-                if error.code == crate::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION =>
-            {
+            StartupResponse::Error(error, response_id) => {
+                if let Some(response_id) = response_id.as_ref()
+                    && !id.matches_response_id(response_id)
+                {
+                    return Err(ClientInitializeError::ConflictInitResponseId(
+                        id,
+                        response_id.clone(),
+                    )
+                    .into());
+                }
+
+                if error.code != crate::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
+                    || response_id.is_none()
+                {
+                    return Err(DiscoverStartupError::json_rpc(
+                        error,
+                        candidate,
+                        id,
+                        response_id,
+                    ));
+                }
+
                 let supported = error
                     .data
                     .as_ref()
@@ -865,11 +1022,11 @@ where
                     return Err(ClientInitializeError::NoCompatibleProtocolVersion {
                         client_supported: preferred_versions,
                         server_supported: supported,
-                    });
+                    }
+                    .into());
                 };
                 candidate = next;
             }
-            Err(error) => return Err(error),
         }
     }
 }

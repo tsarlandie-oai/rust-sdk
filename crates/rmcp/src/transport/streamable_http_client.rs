@@ -19,7 +19,7 @@ use super::common::client_side_sse::{
 use crate::{
     RoleClient,
     model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorData, GetMeta,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorCode, ErrorData, GetMeta,
         InitializedNotification, JsonObject, ProtocolVersion, RequestId, ServerJsonRpcMessage,
         ServerResult,
     },
@@ -824,6 +824,14 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
             ClientJsonRpcMessage::Request(request)
                 if matches!(&request.request, ClientRequest::InitializeRequest(_))
         );
+        let discover_startup_id = match &startup_request {
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, ClientRequest::DiscoverRequest(_)) =>
+            {
+                Some(request.id.clone())
+            }
+            _ => None,
+        };
         let mut saved_init_request = is_legacy_startup.then(|| startup_request.clone());
         let empty_tool_cache = HashMap::new();
         let (bootstrap_version, bootstrap_headers) = if is_legacy_startup {
@@ -853,6 +861,26 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
                 res.expect_initialized::<C::Error>().await.map_err(
                     WorkerQuitReason::fatal_context("process initialize response"),
                 )?
+            }
+            Err(StreamableHttpError::UnexpectedServerResponse(response))
+                if discover_startup_id.is_some()
+                    && (response.starts_with("HTTP 404 ") || response.starts_with("HTTP 405 ")) =>
+            {
+                // An initial discover request has no session, so 404/405 can
+                // indicate a legacy endpoint. Keep the worker alive long enough
+                // for Auto mode to retry the legacy initialize handshake.
+                let _ = responder.send(Ok(()));
+                (
+                    ServerJsonRpcMessage::error(
+                        ErrorData::new(
+                            ErrorCode::METHOD_NOT_FOUND,
+                            "Server does not support discovery",
+                            None,
+                        ),
+                        discover_startup_id,
+                    ),
+                    None,
+                )
             }
             Err(err) => {
                 let msg = format!("{:?}", err);
