@@ -3548,10 +3548,20 @@ impl AuthorizationSession {
         if request.scopes.is_empty() {
             request.scopes = auth_manager.select_scopes(None, &[]);
         } else {
-            request
-                .scopes
-                .extend(auth_manager.granted_and_challenged_scopes());
-            request.scopes = AuthorizationManager::dedup_scopes(request.scopes);
+            let mut scopes = auth_manager
+                .www_auth_scopes
+                .try_read()
+                .map(|challenged| {
+                    challenged
+                        .iter()
+                        .filter(|scope| !request.scopes.contains(scope))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            scopes.append(&mut request.scopes);
+            scopes.extend(auth_manager.granted_and_challenged_scopes());
+            request.scopes = AuthorizationManager::dedup_scopes(scopes);
             auth_manager.add_offline_access_if_supported(&mut request.scopes);
         }
 
@@ -5504,6 +5514,35 @@ mod tests {
             session.context().requested_scopes,
             vec!["requested", "challenged", "previous"]
         );
+    }
+
+    #[tokio::test]
+    async fn authorization_session_prioritizes_missing_challenge_scopes() {
+        for (challenged, expected) in [
+            (
+                vec!["challenged".to_string()],
+                vec!["challenged", "requested", "previous"],
+            ),
+            (Vec::new(), vec!["requested", "previous"]),
+        ] {
+            let manager = manager_with_metadata(None).await;
+            *manager.current_scopes.write().await = vec!["previous".to_string()];
+            *manager.www_auth_scopes.write().await = challenged;
+
+            let session = match AuthorizationSession::new(
+                manager,
+                AuthorizationRequest::new("http://localhost:8080/callback")
+                    .with_preregistered_client("preregistered-client")
+                    .with_scopes(["requested"]),
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err((_, error)) => panic!("authorization session creation failed: {error}"),
+            };
+
+            assert_eq!(session.context().requested_scopes, expected);
+        }
     }
 
     #[tokio::test]
