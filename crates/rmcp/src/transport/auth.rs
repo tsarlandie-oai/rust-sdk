@@ -1043,6 +1043,7 @@ pub struct AuthorizationManager {
     application_type: Option<String>,
     protocol_mode: OAuthProtocolMode,
     legacy_discovery_fallback: AtomicBool,
+    allows_anonymous_access: AtomicBool,
     resource_policy: OAuthResourcePolicy,
     refresh_resource_policy: OAuthRefreshResourcePolicy,
     configured_client_secret: Option<String>,
@@ -1293,6 +1294,7 @@ impl AuthorizationManager {
             application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
             protocol_mode: OAuthProtocolMode::Legacy,
             legacy_discovery_fallback: AtomicBool::new(false),
+            allows_anonymous_access: AtomicBool::new(false),
             resource_policy: OAuthResourcePolicy::Endpoint,
             refresh_resource_policy: OAuthRefreshResourcePolicy::Include,
             configured_client_secret: None,
@@ -1319,6 +1321,16 @@ impl AuthorizationManager {
     /// Return the configured OAuth discovery protocol generation.
     pub fn protocol_mode(&self) -> OAuthProtocolMode {
         self.protocol_mode
+    }
+
+    /// Whether modern OAuth discovery proved that only legacy startup is supported.
+    pub fn legacy_discovery_fallback(&self) -> bool {
+        self.legacy_discovery_fallback.load(Ordering::Relaxed)
+    }
+
+    /// Whether discovery explicitly reported that authentication is optional.
+    pub fn allows_anonymous_access(&self) -> bool {
+        self.allows_anonymous_access.load(Ordering::Relaxed)
     }
 
     /// Select the resource identifier used for authorization and token exchange.
@@ -2354,7 +2366,14 @@ impl AuthorizationManager {
         }
 
         match serde_json::from_slice::<AuthorizationMetadata>(response.body()) {
-            Ok(metadata) => {
+            Ok(mut metadata) => {
+                if metadata.issuer.is_none()
+                    && (self.protocol_mode == OAuthProtocolMode::Legacy
+                        || self.legacy_discovery_fallback())
+                {
+                    metadata.issuer =
+                        Self::expected_issuer_for_authorization_metadata_url(discovery_url);
+                }
                 Self::validate_authorization_metadata_issuer(discovery_url, &metadata)?;
                 Ok(Some(metadata))
             }
@@ -2598,8 +2617,20 @@ impl AuthorizationManager {
         };
 
         match response.status() {
-            StatusCode::OK => Ok(Some(url.clone())),
-            StatusCode::UNAUTHORIZED => Ok(self
+            StatusCode::OK => {
+                if self.protocol_mode == OAuthProtocolMode::Modern
+                    && Self::is_same_origin(&self.base_url, url)
+                    && self.base_url.path() == url.path()
+                    && serde_json::from_slice::<Value>(response.body())
+                        .ok()
+                        .and_then(|body| body.get("isPublicEndpoint").and_then(Value::as_bool))
+                        == Some(true)
+                {
+                    self.allows_anonymous_access.store(true, Ordering::Relaxed);
+                }
+                Ok(Some(url.clone()))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Ok(self
                 .extract_resource_metadata_url_from_www_authenticate(&response)
                 .await),
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED if allow_post_probe => {
@@ -2653,6 +2684,21 @@ impl AuthorizationManager {
                     return Ok(None);
                 }
             };
+        }
+
+        if self.protocol_mode == OAuthProtocolMode::Modern
+            && Self::is_same_origin(&self.base_url, url)
+            && self.base_url.path() == url.path()
+            && response.status().is_success()
+            && serde_json::from_slice::<Value>(response.body())
+                .ok()
+                .and_then(|body| {
+                    body.pointer("/result/authentication/required")
+                        .and_then(Value::as_bool)
+                })
+                == Some(false)
+        {
+            self.allows_anonymous_access.store(true, Ordering::Relaxed);
         }
 
         if response.status() != StatusCode::UNAUTHORIZED {
@@ -2752,23 +2798,22 @@ impl AuthorizationManager {
         response: &HttpResponse,
     ) -> Option<Url> {
         let mut parsed_url = None;
+        let mut challenged_scopes = self.www_auth_scopes.read().await.clone();
         for value in response.headers().get_all(WWW_AUTHENTICATE).iter() {
             let Ok(value_str) = value.to_str() else {
                 continue;
             };
             let params = Self::extract_www_authenticate_params(value_str, &self.base_url);
-            if let Some(url) = params.resource_metadata_url {
-                if let Some(scope) = &params.scope {
-                    debug!("WWW-Authenticate header contains scope: {}", scope);
-                    let scopes: Vec<String> =
-                        scope.split_whitespace().map(|s| s.to_string()).collect();
-                    *self.www_auth_scopes.write().await = scopes;
-                }
-                parsed_url = Some(url);
-                break;
+            if let Some(scope) = &params.scope {
+                debug!("WWW-Authenticate header contains scope: {}", scope);
+                challenged_scopes.extend(scope.split_whitespace().map(str::to_string));
+            }
+            if parsed_url.is_none() {
+                parsed_url = params.resource_metadata_url;
             }
         }
 
+        *self.www_auth_scopes.write().await = Self::dedup_scopes(challenged_scopes);
         parsed_url
     }
 
@@ -4618,6 +4663,7 @@ mod tests {
                 Some("2024-11-05"),
             )
         );
+        assert!(manager.legacy_discovery_fallback());
     }
 
     #[test]
@@ -4712,6 +4758,113 @@ mod tests {
                 &response
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_detects_public_resource_get_response() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({"isPublicEndpoint": true}),
+        )]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        manager
+            .fetch_resource_metadata_url(&Url::parse("https://mcp.example.com/mcp").unwrap(), true)
+            .await
+            .unwrap();
+
+        assert!(manager.allows_anonymous_access());
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_detects_public_server_discover_response() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "auth-discovery-modern",
+                "result": {"authentication": {"required": false}}
+            }),
+        )]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        manager
+            .fetch_resource_metadata_url_with_post_probe(
+                &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(manager.allows_anonymous_access());
+    }
+
+    #[tokio::test]
+    async fn legacy_discovery_does_not_reclassify_optional_authentication() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({"isPublicEndpoint": true}),
+        )]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        manager
+            .fetch_resource_metadata_url(&Url::parse("https://mcp.example.com/mcp").unwrap(), true)
+            .await
+            .unwrap();
+
+        assert!(!manager.allows_anonymous_access());
+    }
+
+    #[tokio::test]
+    async fn oauth_discovery_unions_standalone_scope_challenges() {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header("www-authenticate", r#"Bearer scope="read write""#)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/metadata", scope="write admin""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![challenge]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        let resource_metadata_url = manager
+            .fetch_resource_metadata_url(&Url::parse("https://mcp.example.com/mcp").unwrap(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                resource_metadata_url.map(|url| url.to_string()),
+                manager.select_scopes(None, &[]),
+            ),
+            (
+                Some("https://mcp.example.com/metadata".to_string()),
+                vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            )
+        );
     }
 
     #[tokio::test]
@@ -4889,6 +5042,109 @@ mod tests {
                     if expected_issuer == "https://auth.example.com/tenant1"
             ),
             "expected missing issuer error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_discovery_synthesizes_missing_authorization_issuer() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({
+                "authorization_endpoint": "https://auth.example.com/tenant/authorize",
+                "token_endpoint": "https://auth.example.com/tenant/token"
+            }),
+        )]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        let metadata = manager
+            .fetch_authorization_metadata(
+                &Url::parse(
+                    "https://auth.example.com/.well-known/oauth-authorization-server/tenant",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            metadata.issuer.as_deref(),
+            Some("https://auth.example.com/tenant")
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_rejects_missing_authorization_issuer_without_proven_fallback() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({
+                "authorization_endpoint": "https://auth.example.com/tenant/authorize",
+                "token_endpoint": "https://auth.example.com/tenant/token"
+            }),
+        )]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        let error = manager
+            .fetch_authorization_metadata(
+                &Url::parse(
+                    "https://auth.example.com/.well-known/oauth-authorization-server/tenant",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AuthError::AuthorizationServerMissingIssuer { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_synthesizes_missing_issuer_after_proven_legacy_fallback() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({
+                "authorization_endpoint": "https://auth.example.com/tenant/authorize",
+                "token_endpoint": "https://auth.example.com/tenant/token"
+            }),
+        )]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+        manager
+            .legacy_discovery_fallback
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let metadata = manager
+            .fetch_authorization_metadata(
+                &Url::parse(
+                    "https://auth.example.com/.well-known/oauth-authorization-server/tenant",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            metadata.issuer.as_deref(),
+            Some("https://auth.example.com/tenant")
         );
     }
 
