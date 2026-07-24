@@ -3546,7 +3546,12 @@ impl AuthorizationSession {
         }
 
         if request.scopes.is_empty() {
-            request.scopes = auth_manager.select_scopes(None, &[]);
+            request.scopes = auth_manager.granted_and_challenged_scopes();
+            if request.scopes.is_empty() {
+                request.scopes = auth_manager.select_scopes(None, &[]);
+            } else {
+                auth_manager.add_offline_access_if_supported(&mut request.scopes);
+            }
         } else {
             let mut scopes = auth_manager
                 .www_auth_scopes
@@ -5534,6 +5539,40 @@ mod tests {
                 AuthorizationRequest::new("http://localhost:8080/callback")
                     .with_preregistered_client("preregistered-client")
                     .with_scopes(["requested"]),
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err((_, error)) => panic!("authorization session creation failed: {error}"),
+            };
+
+            assert_eq!(session.context().requested_scopes, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_session_uses_challenge_scopes_without_advisory_resource_scopes() {
+        for (supported_scopes, expected) in [
+            (
+                vec!["optional".to_string(), "offline_access".to_string()],
+                vec!["challenged", "offline_access"],
+            ),
+            (vec!["optional".to_string()], vec!["challenged"]),
+        ] {
+            let manager = manager_with_metadata(Some(AuthorizationMetadata {
+                authorization_endpoint: "http://localhost/authorize".to_string(),
+                token_endpoint: "http://localhost/token".to_string(),
+                scopes_supported: Some(supported_scopes),
+                ..Default::default()
+            }))
+            .await;
+            *manager.www_auth_scopes.write().await = vec!["challenged".to_string()];
+            *manager.resource_scopes.write().await = vec!["optional".to_string()];
+
+            let session = match AuthorizationSession::new(
+                manager,
+                AuthorizationRequest::new("http://localhost:8080/callback")
+                    .with_preregistered_client("preregistered-client"),
             )
             .await
             {
