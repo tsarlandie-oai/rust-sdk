@@ -1919,6 +1919,16 @@ impl AuthorizationManager {
     }
 
     fn operational_scopes(&self) -> Vec<String> {
+        let mut scopes = self.granted_and_challenged_scopes();
+
+        if let Ok(required) = self.resource_scopes.try_read() {
+            scopes.extend(required.iter().cloned());
+        }
+
+        Self::dedup_scopes(scopes)
+    }
+
+    fn granted_and_challenged_scopes(&self) -> Vec<String> {
         let mut scopes = Vec::new();
 
         if let Ok(granted) = self.current_scopes.try_read() {
@@ -1926,9 +1936,6 @@ impl AuthorizationManager {
         }
         if let Ok(challenged) = self.www_auth_scopes.try_read() {
             scopes.extend(challenged.iter().cloned());
-        }
-        if let Ok(required) = self.resource_scopes.try_read() {
-            scopes.extend(required.iter().cloned());
         }
 
         Self::dedup_scopes(scopes)
@@ -3541,7 +3548,9 @@ impl AuthorizationSession {
         if request.scopes.is_empty() {
             request.scopes = auth_manager.select_scopes(None, &[]);
         } else {
-            request.scopes.extend(auth_manager.operational_scopes());
+            request
+                .scopes
+                .extend(auth_manager.granted_and_challenged_scopes());
             request.scopes = AuthorizationManager::dedup_scopes(request.scopes);
             auth_manager.add_offline_access_if_supported(&mut request.scopes);
         }
@@ -5493,7 +5502,7 @@ mod tests {
 
         assert_eq!(
             session.context().requested_scopes,
-            vec!["requested", "challenged", "previous", "required"]
+            vec!["requested", "challenged", "previous"]
         );
     }
 
