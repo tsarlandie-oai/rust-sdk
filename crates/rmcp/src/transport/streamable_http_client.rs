@@ -33,6 +33,26 @@ type BoxedSseStream = BoxStream<'static, Result<Sse, SseError>>;
 type SseTaskResult<E> = (Option<RequestId>, Result<(), StreamableHttpError<E>>);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether a successful HTTP response contains an uncorrelated discovery error.
+///
+/// An HTTP 400 can carry an ID-less error from a legacy endpoint that rejected
+/// discovery before parsing the JSON-RPC request. A successful HTTP response
+/// cannot provide the same evidence, so callers must reject it rather than use
+/// it to justify falling back to legacy initialization.
+pub fn is_uncorrelated_successful_discovery_error(
+    request: &ClientJsonRpcMessage,
+    response: &ServerJsonRpcMessage,
+    http_status: u16,
+) -> bool {
+    (200..300).contains(&http_status)
+        && matches!(
+            request,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, ClientRequest::DiscoverRequest(_))
+        )
+        && matches!(response, ServerJsonRpcMessage::Error(error) if error.id.is_none())
+}
+
 fn build_request_headers(
     base: &HashMap<HeaderName, HeaderValue>,
     message: &ClientJsonRpcMessage,
@@ -1779,9 +1799,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::model::{ListToolsResult, NumberOrString, ServerResult, Tool};
+    use crate::model::{
+        DiscoverRequest, DiscoverRequestParams, ListToolsResult, NumberOrString, ServerResult, Tool,
+    };
 
     type ReconnectAttempt = (Option<String>, Option<String>);
+
+    #[test]
+    fn successful_discovery_errors_require_a_correlated_response() {
+        let request = ClientJsonRpcMessage::request(
+            ClientRequest::DiscoverRequest(DiscoverRequest::new(DiscoverRequestParams {})),
+            RequestId::Number(1),
+        );
+        let uncorrelated = ServerJsonRpcMessage::error(
+            ErrorData::new(ErrorCode(-32000), "No valid session ID provided", None),
+            None,
+        );
+        let correlated = ServerJsonRpcMessage::error(
+            ErrorData::new(ErrorCode(-32000), "No valid session ID provided", None),
+            Some(RequestId::Number(1)),
+        );
+
+        assert!(is_uncorrelated_successful_discovery_error(
+            &request,
+            &uncorrelated,
+            200,
+        ));
+        assert!(!is_uncorrelated_successful_discovery_error(
+            &request,
+            &uncorrelated,
+            400,
+        ));
+        assert!(!is_uncorrelated_successful_discovery_error(
+            &request,
+            &correlated,
+            200,
+        ));
+    }
 
     #[derive(Clone, Default)]
     struct StatelessReconnectClient {

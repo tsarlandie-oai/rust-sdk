@@ -448,6 +448,23 @@ async fn auto_startup_does_not_fall_back_for_unknown_or_future_protocol_versions
 }
 
 #[tokio::test]
+async fn auto_startup_does_not_fall_back_for_a_single_uncorrelated_historical_version() {
+    let error = assert_auto_startup_does_not_fall_back(|_| {
+        ServerJsonRpcMessage::error(
+            ErrorData::new(
+                ErrorCode(-32000),
+                "Bad Request: Unsupported protocol version: 2026-07-28 \
+                 (supported versions: 2025-11-25)",
+                None,
+            ),
+            None,
+        )
+    })
+    .await;
+    assert!(matches!(error, ClientInitializeError::JsonRpcError(_)));
+}
+
+#[tokio::test]
 async fn auto_startup_does_not_fall_back_for_unknown_protocol_version_tokens() {
     let error = assert_auto_startup_does_not_fall_back(|_| {
         ServerJsonRpcMessage::error(

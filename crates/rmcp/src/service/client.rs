@@ -660,9 +660,10 @@ impl DiscoverStartupError {
                     (None, None) => None,
                 };
 
-                supported
-                    .as_deref()
-                    .is_some_and(exclusively_historical_protocol_versions)
+                supported.as_deref().is_some_and(|versions| {
+                    (correlated || versions.len() > 1)
+                        && exclusively_historical_protocol_versions(versions)
+                })
             }
             _ => false,
         }

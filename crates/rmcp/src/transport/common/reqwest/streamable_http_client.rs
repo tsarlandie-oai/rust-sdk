@@ -288,6 +288,17 @@ impl StreamableHttpClient for reqwest::Client {
                 // malformed (e.g. a 200 response to a notification that lacks
                 // an `id` field), treat it as accepted rather than failing.
                 match response.json::<ServerJsonRpcMessage>().await {
+                    Ok(response_message)
+                        if is_uncorrelated_successful_discovery_error(
+                            &message,
+                            &response_message,
+                            status.as_u16(),
+                        ) =>
+                    {
+                        Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                            format!("HTTP {status}: uncorrelated discovery error"),
+                        )))
+                    }
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
                     Err(e) => {
                         tracing::warn!(

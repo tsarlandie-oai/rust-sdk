@@ -153,6 +153,8 @@ async fn auto_http_client_falls_back_to_stateful_legacy_startup() {
 enum LegacyDiscoveryRejection {
     UnsupportedProtocol,
     MissingSession,
+    MissingSessionSuccessfulResponse,
+    SingleHistoricalVersion,
     NotFound,
     MethodNotAllowed,
     Unauthorized,
@@ -205,6 +207,29 @@ async fn legacy_prevalidation_handler(
                     "error": {
                         "code": -32000,
                         "message": "Bad Request: No valid session ID provided",
+                    },
+                }),
+            ),
+            LegacyDiscoveryRejection::MissingSessionSuccessfulResponse => json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32000,
+                        "message": "Bad Request: No valid session ID provided",
+                    },
+                }),
+            ),
+            LegacyDiscoveryRejection::SingleHistoricalVersion => json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32000,
+                        "message": "Bad Request: Unsupported protocol version: 2026-07-28 \
+                            (supported versions: 2025-11-25)",
                     },
                 }),
             ),
@@ -391,10 +416,7 @@ async fn assert_http_auth_rejection_does_not_downgrade(rejection: LegacyDiscover
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "authentication failures must not downgrade"
-    );
+    assert!(result.is_err(), "unproven legacy errors must not downgrade");
     assert_eq!(*methods.lock().expect("methods lock"), ["server/discover"]);
     cancellation.cancel();
     server.await.expect("server task");
@@ -418,4 +440,20 @@ async fn auto_http_client_does_not_downgrade_after_json_rpc_http_401() {
 #[tokio::test]
 async fn auto_http_client_does_not_downgrade_after_json_rpc_http_403() {
     assert_http_auth_rejection_does_not_downgrade(LegacyDiscoveryRejection::ForbiddenJson).await;
+}
+
+#[tokio::test]
+async fn auto_http_client_does_not_downgrade_after_successful_missing_session_response() {
+    assert_http_auth_rejection_does_not_downgrade(
+        LegacyDiscoveryRejection::MissingSessionSuccessfulResponse,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn auto_http_client_does_not_downgrade_for_a_single_uncorrelated_historical_version() {
+    assert_http_auth_rejection_does_not_downgrade(
+        LegacyDiscoveryRejection::SingleHistoricalVersion,
+    )
+    .await;
 }
