@@ -3,7 +3,10 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -52,6 +55,31 @@ pub enum OAuthHttpRedirectPolicy {
     Follow,
     /// Return the redirect response without following its location.
     Stop,
+}
+
+/// MCP protocol generation used for OAuth discovery requests.
+///
+/// The legacy mode preserves the historical request headers used before
+/// protocol-aware discovery was introduced. Modern mode advertises the current
+/// protocol and only retries with legacy headers when a server explicitly
+/// rejects the modern protocol version.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthProtocolMode {
+    /// Preserve the historical OAuth discovery request shape.
+    #[default]
+    Legacy,
+    /// Advertise the modern MCP protocol during OAuth discovery.
+    Modern,
+}
+
+impl OAuthProtocolMode {
+    fn protocol_version(self) -> &'static str {
+        match self {
+            Self::Legacy => "2024-11-05",
+            Self::Modern => "2026-07-28",
+        }
+    }
 }
 
 /// A complete outbound HTTP operation requested by the OAuth implementation.
@@ -985,6 +1013,8 @@ pub struct AuthorizationManager {
     resource_scopes: RwLock<Vec<String>>,
     /// OIDC Dynamic Client Registration `application_type` (SEP-837)
     application_type: Option<String>,
+    protocol_mode: OAuthProtocolMode,
+    legacy_discovery_fallback: AtomicBool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1230,6 +1260,8 @@ impl AuthorizationManager {
             www_auth_scopes: RwLock::new(Vec::new()),
             resource_scopes: RwLock::new(Vec::new()),
             application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
+            protocol_mode: OAuthProtocolMode::Legacy,
+            legacy_discovery_fallback: AtomicBool::new(false),
         };
 
         Ok(manager)
@@ -1238,6 +1270,21 @@ impl AuthorizationManager {
     /// Set the scope upgrade configuration
     pub fn set_scope_upgrade_config(&mut self, config: ScopeUpgradeConfig) {
         self.scope_upgrade_config = config;
+    }
+
+    /// Select the MCP protocol generation advertised during OAuth discovery.
+    ///
+    /// Existing managers default to [`OAuthProtocolMode::Legacy`], preserving
+    /// their historical discovery behavior.
+    pub fn set_protocol_mode(&mut self, mode: OAuthProtocolMode) {
+        self.protocol_mode = mode;
+        self.legacy_discovery_fallback
+            .store(false, Ordering::Relaxed);
+    }
+
+    /// Return the configured OAuth discovery protocol generation.
+    pub fn protocol_mode(&self) -> OAuthProtocolMode {
+        self.protocol_mode
     }
 
     /// Set a custom credential store
@@ -2468,7 +2515,10 @@ impl AuthorizationManager {
         let request = oauth2::http::Request::builder()
             .method("POST")
             .uri(url.as_str())
-            .header(HEADER_MCP_PROTOCOL_VERSION, "2024-11-05")
+            .header(
+                HEADER_MCP_PROTOCOL_VERSION,
+                self.discovery_protocol_version(),
+            )
             .header(CONTENT_TYPE, "application/json")
             .body(RESOURCE_METADATA_POST_PROBE_BODY.as_bytes().to_vec())
             .map_err(|error| AuthError::InternalError(error.to_string()))?;
@@ -2562,19 +2612,24 @@ impl AuthorizationManager {
     async fn discovery_get(&self, url: &Url) -> Result<HttpResponse, OAuthHttpClientError> {
         let mut current_url = url.clone();
         for _ in 0..MAX_OAUTH_DISCOVERY_REDIRECTS {
-            let request = oauth2::http::Request::builder()
-                .method("GET")
-                .uri(current_url.as_str())
-                .header(HEADER_MCP_PROTOCOL_VERSION, "2024-11-05")
-                .body(Vec::new())
-                .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
-            let response = self
-                .http_client
-                .execute(OAuthHttpRequest::new(
-                    request,
-                    OAuthHttpRedirectPolicy::Stop,
-                ))
+            let mut response = self
+                .execute_discovery_get(&current_url, self.discovery_protocol_version())
                 .await?;
+
+            if self.protocol_mode == OAuthProtocolMode::Modern
+                && !self.legacy_discovery_fallback.load(Ordering::Relaxed)
+                && Self::is_unsupported_protocol_response(&response)
+            {
+                debug!("OAuth discovery rejected the modern protocol; retrying legacy headers");
+                response = self
+                    .execute_discovery_get(
+                        &current_url,
+                        OAuthProtocolMode::Legacy.protocol_version(),
+                    )
+                    .await?;
+                self.legacy_discovery_fallback
+                    .store(true, Ordering::Relaxed);
+            }
 
             if !response.status().is_redirection() {
                 return Ok(response);
@@ -2603,6 +2658,47 @@ impl AuthorizationManager {
         Err(OAuthHttpClientError::new(format!(
             "OAuth discovery exceeded {MAX_OAUTH_DISCOVERY_REDIRECTS} redirects"
         )))
+    }
+
+    fn discovery_protocol_version(&self) -> &'static str {
+        if self.legacy_discovery_fallback.load(Ordering::Relaxed) {
+            OAuthProtocolMode::Legacy.protocol_version()
+        } else {
+            self.protocol_mode.protocol_version()
+        }
+    }
+
+    async fn execute_discovery_get(
+        &self,
+        url: &Url,
+        protocol_version: &'static str,
+    ) -> Result<HttpResponse, OAuthHttpClientError> {
+        let request = oauth2::http::Request::builder()
+            .method("GET")
+            .uri(url.as_str())
+            .header(HEADER_MCP_PROTOCOL_VERSION, protocol_version)
+            .body(Vec::new())
+            .map_err(|error| OAuthHttpClientError::new(error.to_string()))?;
+
+        self.http_client
+            .execute(OAuthHttpRequest::new(
+                request,
+                OAuthHttpRedirectPolicy::Stop,
+            ))
+            .await
+    }
+
+    fn is_unsupported_protocol_response(response: &HttpResponse) -> bool {
+        if response.status() != StatusCode::BAD_REQUEST {
+            return false;
+        }
+
+        let body = String::from_utf8_lossy(response.body()).to_ascii_lowercase();
+        body.contains("protocol")
+            && body.contains("version")
+            && (body.contains("unsupported")
+                || body.contains("not supported")
+                || body.contains("invalid"))
     }
 
     /// extract parameters from WWW-Authenticate header (resource_metadata and scope)
@@ -3746,7 +3842,7 @@ mod tests {
         AuthorizationMetadataSource, AuthorizationRequest, AuthorizationSession, CredentialStore,
         InMemoryCredentialStore, InMemoryStateStore, OAuthClientConfig, OAuthHttpClient,
         OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest,
-        ScopeUpgradeConfig, StateStore, StoredAuthorizationState, is_https_url,
+        OAuthProtocolMode, ScopeUpgradeConfig, StateStore, StoredAuthorizationState, is_https_url,
     };
     use crate::transport::auth::VendorExtraTokenFields;
 
@@ -3761,6 +3857,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingOAuthHttpClient {
         requests: Arc<StdMutex<Vec<RecordedOAuthRequest>>>,
+        protocol_versions: Arc<StdMutex<Vec<Option<String>>>>,
         responses: Arc<StdMutex<VecDeque<HttpResponse>>>,
     }
 
@@ -3775,10 +3872,22 @@ mod tests {
         fn requests(&self) -> Vec<RecordedOAuthRequest> {
             self.requests.lock().unwrap().clone()
         }
+
+        fn protocol_versions(&self) -> Vec<Option<String>> {
+            self.protocol_versions.lock().unwrap().clone()
+        }
     }
 
     impl OAuthHttpClient for RecordingOAuthHttpClient {
         fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+            self.protocol_versions.lock().unwrap().push(
+                request
+                    .request
+                    .headers()
+                    .get(crate::transport::common::http_header::HEADER_MCP_PROTOCOL_VERSION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+            );
             self.requests.lock().unwrap().push(RecordedOAuthRequest {
                 method: request.request.method().to_string(),
                 uri: request.request.uri().to_string(),
@@ -3965,6 +4074,138 @@ mod tests {
                 Some("https://mcp.example.com"),
                 "https://mcp.example.com/token",
                 4,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_discovery_preserves_legacy_protocol_headers_by_default() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![empty_response(404)]);
+        let manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+
+        let response = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/mcp").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                manager.protocol_mode(),
+                response.status(),
+                client.protocol_versions()
+            ),
+            (
+                OAuthProtocolMode::Legacy,
+                oauth2::http::StatusCode::NOT_FOUND,
+                vec![Some("2024-11-05".to_string())],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_discovery_advertises_modern_protocol_when_enabled() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![empty_response(404)]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        let response = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/mcp").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                manager.protocol_mode(),
+                response.status(),
+                client.protocol_versions()
+            ),
+            (
+                OAuthProtocolMode::Modern,
+                oauth2::http::StatusCode::NOT_FOUND,
+                vec![Some("2026-07-28".to_string())],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_oauth_discovery_retries_only_explicit_protocol_rejection() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            http_response(
+                400,
+                serde_json::json!({"error": "unsupported protocol version 2026-07-28"}),
+            ),
+            empty_response(401),
+            empty_response(404),
+        ]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        let first_response = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/mcp").unwrap())
+            .await
+            .unwrap();
+        let second_response = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/metadata").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                first_response.status(),
+                second_response.status(),
+                client.protocol_versions(),
+            ),
+            (
+                oauth2::http::StatusCode::UNAUTHORIZED,
+                oauth2::http::StatusCode::NOT_FOUND,
+                vec![
+                    Some("2026-07-28".to_string()),
+                    Some("2024-11-05".to_string()),
+                    Some("2024-11-05".to_string()),
+                ],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_oauth_discovery_does_not_retry_unrelated_bad_requests() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            400,
+            serde_json::json!({"error": "invalid resource"}),
+        )]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        let response = manager
+            .discovery_get(&Url::parse("https://mcp.example.com/mcp").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (response.status(), client.protocol_versions()),
+            (
+                oauth2::http::StatusCode::BAD_REQUEST,
+                vec![Some("2026-07-28".to_string())],
             )
         );
     }
