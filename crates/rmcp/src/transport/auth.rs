@@ -82,6 +82,28 @@ impl OAuthProtocolMode {
     }
 }
 
+/// Resource identifier attached to OAuth authorization and token requests.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthResourcePolicy {
+    /// Use the MCP server endpoint, preserving the historical SDK behavior.
+    #[default]
+    Endpoint,
+    /// Use a caller-selected protected-resource identifier.
+    Explicit(String),
+}
+
+/// Whether OAuth refresh requests include the RFC 8707 resource indicator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OAuthRefreshResourcePolicy {
+    /// Preserve the historical behavior of sending the resource on refresh.
+    #[default]
+    Include,
+    /// Omit the resource for authorization servers with legacy refresh rules.
+    Omit,
+}
+
 /// A complete outbound HTTP operation requested by the OAuth implementation.
 #[non_exhaustive]
 pub struct OAuthHttpRequest {
@@ -1015,6 +1037,8 @@ pub struct AuthorizationManager {
     application_type: Option<String>,
     protocol_mode: OAuthProtocolMode,
     legacy_discovery_fallback: AtomicBool,
+    resource_policy: OAuthResourcePolicy,
+    refresh_resource_policy: OAuthRefreshResourcePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1262,6 +1286,8 @@ impl AuthorizationManager {
             application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
             protocol_mode: OAuthProtocolMode::Legacy,
             legacy_discovery_fallback: AtomicBool::new(false),
+            resource_policy: OAuthResourcePolicy::Endpoint,
+            refresh_resource_policy: OAuthRefreshResourcePolicy::Include,
         };
 
         Ok(manager)
@@ -1285,6 +1311,24 @@ impl AuthorizationManager {
     /// Return the configured OAuth discovery protocol generation.
     pub fn protocol_mode(&self) -> OAuthProtocolMode {
         self.protocol_mode
+    }
+
+    /// Select the resource identifier used for authorization and token exchange.
+    pub fn set_resource_policy(&mut self, policy: OAuthResourcePolicy) {
+        self.resource_policy = policy;
+    }
+
+    /// Select whether refresh requests include the selected resource identifier.
+    pub fn set_refresh_resource_policy(&mut self, policy: OAuthRefreshResourcePolicy) {
+        self.refresh_resource_policy = policy;
+    }
+
+    /// Return the resource identifier used for OAuth requests.
+    pub fn resource_indicator(&self) -> &str {
+        match &self.resource_policy {
+            OAuthResourcePolicy::Endpoint => self.base_url.as_str(),
+            OAuthResourcePolicy::Explicit(resource) => resource.as_str(),
+        }
     }
 
     /// Set a custom credential store
@@ -1678,7 +1722,7 @@ impl AuthorizationManager {
         let mut auth_request = oauth_client
             .authorize_url(CsrfToken::new_random)
             .set_pkce_challenge(pkce_challenge)
-            .add_extra_param("resource", self.base_url.to_string());
+            .add_extra_param("resource", self.resource_indicator().to_string());
 
         // add request scopes
         for scope in scopes {
@@ -1959,7 +2003,7 @@ impl AuthorizationManager {
         let token_result = match oauth_client
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .set_pkce_verifier(pkce_verifier)
-            .add_extra_param("resource", self.base_url.to_string())
+            .add_extra_param("resource", self.resource_indicator().to_string())
             .request_async(&OAuth2HttpClient {
                 client: self.http_client.as_ref(),
                 redirect_policy: OAuthHttpRedirectPolicy::Stop,
@@ -2101,10 +2145,11 @@ impl AuthorizationManager {
         debug!("refresh token present, attempting refresh");
 
         let refresh_token_value = RefreshToken::new(refresh_token.secret().to_string());
-        let mut refresh_request = oauth_client
-            .exchange_refresh_token(&refresh_token_value)
-            // RFC 8707: the resource indicator is required on token requests, including refreshes
-            .add_extra_param("resource", self.base_url.to_string());
+        let mut refresh_request = oauth_client.exchange_refresh_token(&refresh_token_value);
+        if self.refresh_resource_policy == OAuthRefreshResourcePolicy::Include {
+            refresh_request =
+                refresh_request.add_extra_param("resource", self.resource_indicator().to_string());
+        }
         let mut refresh_scopes = stored_credentials.granted_scopes;
         self.add_offline_access_if_supported(&mut refresh_scopes);
         for scope in refresh_scopes {
@@ -3842,7 +3887,8 @@ mod tests {
         AuthorizationMetadataSource, AuthorizationRequest, AuthorizationSession, CredentialStore,
         InMemoryCredentialStore, InMemoryStateStore, OAuthClientConfig, OAuthHttpClient,
         OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest,
-        OAuthProtocolMode, ScopeUpgradeConfig, StateStore, StoredAuthorizationState, is_https_url,
+        OAuthProtocolMode, OAuthRefreshResourcePolicy, OAuthResourcePolicy, ScopeUpgradeConfig,
+        StateStore, StoredAuthorizationState, is_https_url,
     };
     use crate::transport::auth::VendorExtraTokenFields;
 
@@ -7616,6 +7662,120 @@ mod tests {
             Some("http://localhost/"),
             "refresh requests must carry the RFC 8707 resource parameter, got body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_policy_applies_to_authorization_and_token_exchange() {
+        let (base_url, captured) = start_token_server().await;
+        let mut manager = manager_with_metadata(Some(AuthorizationMetadata {
+            authorization_endpoint: format!("{base_url}/authorize"),
+            token_endpoint: format!("{base_url}/token"),
+            ..Default::default()
+        }))
+        .await;
+        manager.set_resource_policy(OAuthResourcePolicy::Explicit(
+            "https://resource.example.com/".to_string(),
+        ));
+        manager.configure_client(test_client_config()).unwrap();
+
+        let authorization_url = manager.get_authorization_url(&[]).await.unwrap();
+        let authorization_params: HashMap<_, _> = Url::parse(&authorization_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let state = authorization_params.get("state").unwrap();
+
+        manager
+            .exchange_code_for_token("authorization-code", state)
+            .await
+            .unwrap();
+
+        let body = captured.lock().unwrap().take().unwrap();
+        let token_params: HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            (
+                manager.resource_indicator(),
+                authorization_params.get("resource").map(String::as_str),
+                token_params.get("resource").map(String::as_str),
+            ),
+            (
+                "https://resource.example.com/",
+                Some("https://resource.example.com/"),
+                Some("https://resource.example.com/"),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_policy_applies_to_refresh() {
+        let (base_url, captured) = start_token_server().await;
+        let mut manager = manager_with_metadata(Some(AuthorizationMetadata {
+            authorization_endpoint: format!("{base_url}/authorize"),
+            token_endpoint: format!("{base_url}/token"),
+            ..Default::default()
+        }))
+        .await;
+        manager.set_resource_policy(OAuthResourcePolicy::Explicit(
+            "https://resource.example.com/".to_string(),
+        ));
+        manager.configure_client(test_client_config()).unwrap();
+        manager
+            .credential_store
+            .save(StoredCredentials {
+                client_id: "my-client".to_string(),
+                token_response: Some(make_token_response_with_refresh("old-token", "refresh")),
+                granted_scopes: vec![],
+                token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                issuer: None,
+            })
+            .await
+            .unwrap();
+
+        manager.refresh_token().await.unwrap();
+
+        let body = captured.lock().unwrap().take().unwrap();
+        let params: HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            params.get("resource").map(String::as_str),
+            Some("https://resource.example.com/")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_resource_policy_can_preserve_legacy_servers() {
+        let (base_url, captured) = start_token_server().await;
+        let mut manager = manager_with_metadata(Some(AuthorizationMetadata {
+            authorization_endpoint: format!("{base_url}/authorize"),
+            token_endpoint: format!("{base_url}/token"),
+            ..Default::default()
+        }))
+        .await;
+        manager.set_refresh_resource_policy(OAuthRefreshResourcePolicy::Omit);
+        manager.configure_client(test_client_config()).unwrap();
+        manager
+            .credential_store
+            .save(StoredCredentials {
+                client_id: "my-client".to_string(),
+                token_response: Some(make_token_response_with_refresh("old-token", "refresh")),
+                granted_scopes: vec![],
+                token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                issuer: None,
+            })
+            .await
+            .unwrap();
+
+        manager.refresh_token().await.unwrap();
+
+        let body = captured.lock().unwrap().take().unwrap();
+        let params: HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert!(!params.contains_key("resource"));
     }
 
     #[tokio::test]
