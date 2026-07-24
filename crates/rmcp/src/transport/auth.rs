@@ -21,7 +21,7 @@ use oauth2::{
 };
 use reqwest::{
     Client as ReqwestClient, IntoUrl, StatusCode, Url,
-    header::{AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,7 +29,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
-use crate::transport::common::http_header::HEADER_MCP_PROTOCOL_VERSION;
+use crate::{model::ProtocolVersion, transport::common::http_header::HEADER_MCP_PROTOCOL_VERSION};
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -39,6 +39,12 @@ const RESOURCE_METADATA_POST_PROBE_BODY: &str = concat!(
     r#""protocolVersion":"2024-11-05","capabilities":{},"#,
     r#""clientInfo":{"name":"rmcp-auth-discovery","version":"0.0.0"}}"#,
     r#"}"#
+);
+const MODERN_RESOURCE_METADATA_POST_PROBE_BODY: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":"auth-discovery-modern","method":"server/discover","params":{"_meta":{"#,
+    r#""io.modelcontextprotocol/protocolVersion":"2026-07-28","#,
+    r#""io.modelcontextprotocol/clientInfo":{"name":"rmcp-auth-discovery","version":"0.0.0"},"#,
+    r#""io.modelcontextprotocol/clientCapabilities":{}}}}"#,
 );
 const CLOUD_METADATA_HOSTS: &[&str] = &[
     "metadata",
@@ -2557,17 +2563,10 @@ impl AuthorizationManager {
         &self,
         url: &Url,
     ) -> Result<Option<Url>, AuthError> {
-        let request = oauth2::http::Request::builder()
-            .method("POST")
-            .uri(url.as_str())
-            .header(
-                HEADER_MCP_PROTOCOL_VERSION,
-                self.discovery_protocol_version(),
-            )
-            .header(CONTENT_TYPE, "application/json")
-            .body(RESOURCE_METADATA_POST_PROBE_BODY.as_bytes().to_vec())
-            .map_err(|error| AuthError::InternalError(error.to_string()))?;
-        let response = match self
+        let modern_probe = self.protocol_mode == OAuthProtocolMode::Modern
+            && !self.legacy_discovery_fallback.load(Ordering::Relaxed);
+        let request = self.discovery_post_probe_request(url, modern_probe)?;
+        let mut response = match self
             .http_client
             .execute(OAuthHttpRequest::new(
                 request,
@@ -2582,6 +2581,27 @@ impl AuthorizationManager {
             }
         };
 
+        if modern_probe && Self::should_retry_legacy_oauth_discovery(&response) {
+            debug!("modern OAuth discovery proved the server requires legacy initialization");
+            self.legacy_discovery_fallback
+                .store(true, Ordering::Relaxed);
+            let legacy_request = self.discovery_post_probe_request(url, false)?;
+            response = match self
+                .http_client
+                .execute(OAuthHttpRequest::new(
+                    legacy_request,
+                    OAuthHttpRedirectPolicy::Stop,
+                ))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    debug!("legacy resource metadata POST probe failed: {error}");
+                    return Ok(None);
+                }
+            };
+        }
+
         if response.status() != StatusCode::UNAUTHORIZED {
             debug!(
                 "resource metadata POST probe returned unexpected status: {}",
@@ -2593,6 +2613,85 @@ impl AuthorizationManager {
         Ok(self
             .extract_resource_metadata_url_from_www_authenticate(&response)
             .await)
+    }
+
+    fn discovery_post_probe_request(
+        &self,
+        url: &Url,
+        modern_probe: bool,
+    ) -> Result<HttpRequest, AuthError> {
+        let protocol_version = if modern_probe {
+            OAuthProtocolMode::Modern.protocol_version()
+        } else {
+            OAuthProtocolMode::Legacy.protocol_version()
+        };
+        let body = if modern_probe {
+            MODERN_RESOURCE_METADATA_POST_PROBE_BODY
+        } else {
+            RESOURCE_METADATA_POST_PROBE_BODY
+        };
+        let mut builder = oauth2::http::Request::builder()
+            .method("POST")
+            .uri(url.as_str())
+            .header(HEADER_MCP_PROTOCOL_VERSION, protocol_version)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream");
+        if modern_probe {
+            builder = builder.header("MCP-Method", "server/discover");
+        }
+
+        builder
+            .body(body.as_bytes().to_vec())
+            .map_err(|error| AuthError::InternalError(error.to_string()))
+    }
+
+    fn should_retry_legacy_oauth_discovery(response: &HttpResponse) -> bool {
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return false;
+        }
+
+        match serde_json::from_slice::<Value>(response.body()) {
+            Ok(body) if body.get("id").and_then(Value::as_str) == Some("auth-discovery-modern") => {
+                match body.pointer("/error/code").and_then(Value::as_i64) {
+                    Some(-32601) => true,
+                    Some(-32022) => body
+                        .pointer("/error/data/supported")
+                        .is_some_and(Self::only_known_legacy_protocol_versions),
+                    Some(_) => false,
+                    None => body
+                        .pointer("/result/supportedVersions")
+                        .is_some_and(Self::only_known_legacy_protocol_versions),
+                }
+            }
+            Ok(body) => {
+                response.status() == StatusCode::BAD_REQUEST
+                    && body.get("id").is_some_and(Value::is_null)
+                    && body.pointer("/error/code").and_then(Value::as_i64) == Some(-32000)
+                    && body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| message.to_ascii_lowercase().contains("session id"))
+            }
+            Err(_) => matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+        }
+    }
+
+    fn only_known_legacy_protocol_versions(versions: &Value) -> bool {
+        serde_json::from_value::<Vec<ProtocolVersion>>(versions.clone())
+            .ok()
+            .is_some_and(|versions| {
+                !versions.is_empty()
+                    && versions.iter().all(|version| {
+                        ProtocolVersion::KNOWN_VERSIONS.contains(version)
+                            && version < &ProtocolVersion::V_2026_07_28
+                    })
+            })
     }
 
     async fn extract_resource_metadata_url_from_www_authenticate(
@@ -3904,6 +4003,7 @@ mod tests {
     struct RecordingOAuthHttpClient {
         requests: Arc<StdMutex<Vec<RecordedOAuthRequest>>>,
         protocol_versions: Arc<StdMutex<Vec<Option<String>>>>,
+        mcp_methods: Arc<StdMutex<Vec<Option<String>>>>,
         responses: Arc<StdMutex<VecDeque<HttpResponse>>>,
     }
 
@@ -3922,6 +4022,10 @@ mod tests {
         fn protocol_versions(&self) -> Vec<Option<String>> {
             self.protocol_versions.lock().unwrap().clone()
         }
+
+        fn mcp_methods(&self) -> Vec<Option<String>> {
+            self.mcp_methods.lock().unwrap().clone()
+        }
     }
 
     impl OAuthHttpClient for RecordingOAuthHttpClient {
@@ -3931,6 +4035,14 @@ mod tests {
                     .request
                     .headers()
                     .get(crate::transport::common::http_header::HEADER_MCP_PROTOCOL_VERSION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+            );
+            self.mcp_methods.lock().unwrap().push(
+                request
+                    .request
+                    .headers()
+                    .get("MCP-Method")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string),
             );
@@ -4254,6 +4366,218 @@ mod tests {
                 vec![Some("2026-07-28".to_string())],
             )
         );
+    }
+
+    #[tokio::test]
+    async fn modern_oauth_post_probe_uses_server_discover_request() {
+        let challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/metadata""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![challenge]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        let resource_metadata_url = manager
+            .fetch_resource_metadata_url_with_post_probe(
+                &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            )
+            .await
+            .unwrap();
+        let requests = client.requests();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+
+        assert_eq!(
+            (
+                resource_metadata_url.map(|url| url.to_string()),
+                requests[0].method.as_str(),
+                client.protocol_versions(),
+                client.mcp_methods(),
+                body.pointer("/method").and_then(serde_json::Value::as_str),
+                body.pointer("/id").and_then(serde_json::Value::as_str),
+                body.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+                    .and_then(serde_json::Value::as_str),
+            ),
+            (
+                Some("https://mcp.example.com/metadata".to_string()),
+                "POST",
+                vec![Some("2026-07-28".to_string())],
+                vec![Some("server/discover".to_string())],
+                Some("server/discover"),
+                Some("auth-discovery-modern"),
+                Some("2026-07-28"),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_oauth_post_probe_retries_correlated_method_not_found_with_legacy_initialize() {
+        let legacy_challenge = oauth2::http::Response::builder()
+            .status(401)
+            .header(
+                "www-authenticate",
+                r#"Bearer resource_metadata="https://mcp.example.com/metadata""#,
+            )
+            .body(Vec::new())
+            .unwrap();
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            http_response(
+                200,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+            ),
+            legacy_challenge,
+        ]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client.clone()),
+        )
+        .await
+        .unwrap();
+        manager.set_protocol_mode(OAuthProtocolMode::Modern);
+
+        let resource_metadata_url = manager
+            .fetch_resource_metadata_url_with_post_probe(
+                &Url::parse("https://mcp.example.com/mcp").unwrap(),
+            )
+            .await
+            .unwrap();
+        let request_bodies: Vec<serde_json::Value> = client
+            .requests()
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+
+        assert_eq!(
+            (
+                resource_metadata_url.map(|url| url.to_string()),
+                client.protocol_versions(),
+                client.mcp_methods(),
+                request_bodies
+                    .iter()
+                    .filter_map(|body| body.get("method").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>(),
+                request_bodies[1]
+                    .pointer("/params/protocolVersion")
+                    .and_then(serde_json::Value::as_str),
+            ),
+            (
+                Some("https://mcp.example.com/metadata".to_string()),
+                vec![
+                    Some("2026-07-28".to_string()),
+                    Some("2024-11-05".to_string())
+                ],
+                vec![Some("server/discover".to_string()), None],
+                vec!["server/discover", "initialize"],
+                Some("2024-11-05"),
+            )
+        );
+    }
+
+    #[test]
+    fn modern_oauth_post_probe_only_downgrades_for_proven_legacy_responses() {
+        let cases = [
+            (
+                200,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+                true,
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "different-request",
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+                false,
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32022, "data": {"supported": ["2025-11-25"]}}
+                }),
+                true,
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32022, "data": {"supported": ["2025-11-25", "2026-07-28"]}}
+                }),
+                false,
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32022, "data": {"supported": ["1999-01-01"]}}
+                }),
+                false,
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "result": {"supportedVersions": ["2025-11-25"]}
+                }),
+                true,
+            ),
+            (
+                400,
+                serde_json::json!({
+                    "id": null,
+                    "error": {"code": -32000, "message": "session ID required"}
+                }),
+                true,
+            ),
+            (
+                401,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+                false,
+            ),
+            (
+                403,
+                serde_json::json!({
+                    "id": "auth-discovery-modern",
+                    "error": {"code": -32601, "message": "method not found"}
+                }),
+                false,
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let response = http_response(status, body.clone());
+            assert_eq!(
+                AuthorizationManager::should_retry_legacy_oauth_discovery(&response),
+                expected,
+                "incorrect OAuth downgrade decision for HTTP {status}: {body}"
+            );
+        }
+
+        for status in [404, 405] {
+            let response = empty_response(status);
+            assert!(AuthorizationManager::should_retry_legacy_oauth_discovery(
+                &response
+            ));
+        }
     }
 
     #[tokio::test]
