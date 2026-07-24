@@ -1883,24 +1883,11 @@ impl AuthorizationManager {
         www_authenticate_scope: Option<&str>,
         default_scopes: &[&str],
     ) -> Vec<String> {
-        let mut accumulated: Vec<String> = Vec::new();
-
-        // previously requested scopes
-        if let Ok(guard) = self.current_scopes.try_read() {
-            accumulated.extend(guard.iter().cloned());
-        }
+        let mut accumulated = self.operational_scopes();
 
         // newly challenged scopes for the current operation (RFC 6750 §3.1)
         if let Some(scope) = www_authenticate_scope {
             accumulated.extend(scope.split_whitespace().map(|s| s.to_string()));
-        }
-        if let Ok(guard) = self.www_auth_scopes.try_read() {
-            accumulated.extend(guard.iter().cloned());
-        }
-
-        // scopes required for the current operation per protected resource metadata (RFC 9728)
-        if let Ok(guard) = self.resource_scopes.try_read() {
-            accumulated.extend(guard.iter().cloned());
         }
 
         if !accumulated.is_empty() {
@@ -1917,6 +1904,22 @@ impl AuthorizationManager {
         }
 
         default_scopes.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn operational_scopes(&self) -> Vec<String> {
+        let mut scopes = Vec::new();
+
+        if let Ok(granted) = self.current_scopes.try_read() {
+            scopes.extend(granted.iter().cloned());
+        }
+        if let Ok(challenged) = self.www_auth_scopes.try_read() {
+            scopes.extend(challenged.iter().cloned());
+        }
+        if let Ok(required) = self.resource_scopes.try_read() {
+            scopes.extend(required.iter().cloned());
+        }
+
+        Self::dedup_scopes(scopes)
     }
 
     /// SEP-2207: when the AS advertises `offline_access` in `scopes_supported`, append
@@ -3417,11 +3420,43 @@ impl AuthorizationCallback {
 }
 
 /// oauth2 authorization session, for guiding user to complete the authorization process
+/// Resolved identity and authorization metadata selected for a login session.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct AuthorizationSessionContext {
+    /// Client ID selected through preregistration, CIMD, or dynamic registration.
+    pub client_id: String,
+    /// Secret returned by registration or supplied with a confidential client.
+    pub client_secret: Option<String>,
+    /// Final requested scopes after merging grants, challenges, and caller policy.
+    pub requested_scopes: Vec<String>,
+    /// Authorization-server metadata bound to this login session.
+    pub metadata: AuthorizationMetadata,
+    /// Protected resource indicator used throughout this login session.
+    pub resource: String,
+}
+
+impl std::fmt::Debug for AuthorizationSessionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationSessionContext")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("requested_scopes", &self.requested_scopes)
+            .field("metadata", &self.metadata)
+            .field("resource", &self.resource)
+            .finish()
+    }
+}
+
 #[non_exhaustive]
 pub struct AuthorizationSession {
     pub auth_manager: AuthorizationManager,
     pub auth_url: String,
     pub redirect_uri: String,
+    context: AuthorizationSessionContext,
 }
 
 impl AuthorizationSession {
@@ -3461,6 +3496,8 @@ impl AuthorizationSession {
         if request.scopes.is_empty() {
             request.scopes = auth_manager.select_scopes(None, &[]);
         } else {
+            request.scopes.extend(auth_manager.operational_scopes());
+            request.scopes = AuthorizationManager::dedup_scopes(request.scopes);
             auth_manager.add_offline_access_if_supported(&mut request.scopes);
         }
 
@@ -3541,6 +3578,14 @@ impl AuthorizationSession {
             }
         };
 
+        let context = AuthorizationSessionContext {
+            client_id: config.client_id.clone(),
+            client_secret: config.client_secret.clone(),
+            requested_scopes: scopes.clone(),
+            metadata: auth_manager.metadata.clone().unwrap_or_default(),
+            resource: auth_manager.resource_indicator().to_string(),
+        };
+
         // reset client config
         if let Err(e) = auth_manager.configure_client(config) {
             return Err((auth_manager, e));
@@ -3554,6 +3599,7 @@ impl AuthorizationSession {
             auth_manager,
             auth_url,
             redirect_uri,
+            context,
         })
     }
 
@@ -3563,11 +3609,41 @@ impl AuthorizationSession {
         auth_url: String,
         redirect_uri: &str,
     ) -> Self {
+        let requested_scopes = Url::parse(&auth_url)
+            .ok()
+            .and_then(|url| {
+                url.query_pairs()
+                    .find(|(key, _)| key == "scope")
+                    .map(|(_, scopes)| {
+                        scopes
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default();
+        let context = AuthorizationSessionContext {
+            client_id: auth_manager
+                .oauth_client
+                .as_ref()
+                .map(|client| client.client_id().to_string())
+                .unwrap_or_default(),
+            client_secret: auth_manager.configured_client_secret.clone(),
+            requested_scopes,
+            metadata: auth_manager.metadata.clone().unwrap_or_default(),
+            resource: auth_manager.resource_indicator().to_string(),
+        };
         Self {
             auth_manager,
             auth_url,
             redirect_uri: redirect_uri.to_string(),
+            context,
         }
+    }
+
+    /// Return the final identity, scopes, and metadata selected by the SDK.
+    pub fn context(&self) -> &AuthorizationSessionContext {
+        &self.context
     }
 
     /// get client_id and credentials
@@ -3673,6 +3749,14 @@ pub enum OAuthState {
 }
 
 impl OAuthState {
+    /// Return resolved authorization context while an interactive session is active.
+    pub fn authorization_context(&self) -> Option<&AuthorizationSessionContext> {
+        match self {
+            Self::Session(session) => Some(session.context()),
+            _ => None,
+        }
+    }
+
     fn oauth_http_client_config(&self) -> (Arc<dyn OAuthHttpClient>, OAuthHttpRedirectPolicy) {
         let manager = match self {
             OAuthState::Unauthorized(manager) | OAuthState::Authorized(manager) => manager,
@@ -5037,6 +5121,124 @@ mod tests {
         let query = auth_url_query(&auth_url);
         assert_eq!(query.get("client_id").unwrap(), "preregistered-client");
         assert!(matches!(state, super::OAuthState::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn authorization_context_exposes_registered_identity_scopes_and_metadata() {
+        let client = RecordingOAuthHttpClient::with_responses(preregistered_discovery_responses());
+        let mut state = super::OAuthState::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+
+        assert!(state.authorization_context().is_none());
+        state
+            .start_authorization(
+                AuthorizationRequest::new("http://localhost:8080/callback")
+                    .with_preregistered_client("preregistered-client")
+                    .with_client_secret("confidential-secret")
+                    .with_scopes(["read"]),
+            )
+            .await
+            .unwrap();
+
+        let context = state.authorization_context().unwrap();
+        assert_eq!(
+            (
+                context.client_id.as_str(),
+                context.client_secret.as_deref(),
+                context.requested_scopes.as_slice(),
+                context.metadata.issuer.as_deref(),
+                context.resource.as_str(),
+            ),
+            (
+                "preregistered-client",
+                Some("confidential-secret"),
+                ["read".to_string(), "offline_access".to_string()].as_slice(),
+                Some("https://auth.example.com"),
+                "https://mcp.example.com/mcp",
+            )
+        );
+
+        let debug_output = format!("{context:?}");
+        assert!(!debug_output.contains("confidential-secret"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn authorization_context_exposes_dynamically_registered_client_secret() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![http_response(
+            200,
+            serde_json::json!({
+                "client_id": "registered-client",
+                "client_secret": "registered-secret",
+                "redirect_uris": ["http://localhost:8080/callback"]
+            }),
+        )]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.set_metadata(AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            registration_endpoint: Some("https://auth.example.com/register".to_string()),
+            ..Default::default()
+        });
+
+        let session = match AuthorizationSession::new(
+            manager,
+            AuthorizationRequest::new("http://localhost:8080/callback")
+                .with_client_name("Codex")
+                .with_scopes(["read"]),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err((_, error)) => panic!("authorization session creation failed: {error}"),
+        };
+
+        assert_eq!(
+            (
+                session.context().client_id.as_str(),
+                session.context().client_secret.as_deref(),
+                session.context().requested_scopes.as_slice(),
+            ),
+            (
+                "registered-client",
+                Some("registered-secret"),
+                ["read".to_string()].as_slice(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_session_unions_requested_granted_and_challenged_scopes() {
+        let manager = manager_with_metadata(None).await;
+        *manager.current_scopes.write().await = vec!["previous".to_string()];
+        *manager.www_auth_scopes.write().await = vec!["challenged".to_string()];
+        *manager.resource_scopes.write().await = vec!["required".to_string()];
+
+        let session = match AuthorizationSession::new(
+            manager,
+            AuthorizationRequest::new("http://localhost:8080/callback")
+                .with_preregistered_client("preregistered-client")
+                .with_scopes(["requested", "challenged"]),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err((_, error)) => panic!("authorization session creation failed: {error}"),
+        };
+
+        assert_eq!(
+            session.context().requested_scopes,
+            vec!["requested", "challenged", "previous", "required"]
+        );
     }
 
     #[tokio::test]
