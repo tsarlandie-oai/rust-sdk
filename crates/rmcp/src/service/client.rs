@@ -103,7 +103,7 @@ where
 }
 
 enum StartupResponse {
-    Response(ServerResult, RequestId),
+    Response(Box<ServerResult>, RequestId),
     Error(ErrorData, Option<RequestId>),
 }
 
@@ -123,7 +123,7 @@ where
         match message {
             // Expected message to complete the initialization
             ServerJsonRpcMessage::Response(JsonRpcResponse { id, result, .. }) => {
-                break Ok(StartupResponse::Response(result, id));
+                break Ok(StartupResponse::Response(Box::new(result), id));
             }
             // Handle JSON-RPC error responses
             ServerJsonRpcMessage::Error(error) => {
@@ -897,7 +897,7 @@ where
 
     let (response, response_id) =
         match expect_response(transport, "initialize response", service, peer.clone()).await? {
-            StartupResponse::Response(response, response_id) => (response, response_id),
+            StartupResponse::Response(response, response_id) => (*response, response_id),
             StartupResponse::Error(error, _) => {
                 return Err(ClientInitializeError::JsonRpcError(error));
             }
@@ -968,7 +968,15 @@ where
             })?;
 
         match expect_response(transport, "discover response", service, peer.clone()).await? {
-            StartupResponse::Response(ServerResult::DiscoverResult(result), response_id) => {
+            StartupResponse::Response(response, response_id) => {
+                let result = match *response {
+                    ServerResult::DiscoverResult(result) => result,
+                    response => {
+                        return Err(
+                            ClientInitializeError::ExpectedInitResult(Some(response)).into()
+                        );
+                    }
+                };
                 if !id.matches_response_id(&response_id) {
                     return Err(
                         ClientInitializeError::ConflictInitResponseId(id, response_id).into(),
@@ -996,9 +1004,6 @@ where
                     client_capabilities: client_info.capabilities.clone(),
                 });
                 return Ok(());
-            }
-            StartupResponse::Response(response, _) => {
-                return Err(ClientInitializeError::ExpectedInitResult(Some(response)).into());
             }
             StartupResponse::Error(error, response_id) => {
                 if let Some(response_id) = response_id.as_ref()
