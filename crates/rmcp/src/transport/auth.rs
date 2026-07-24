@@ -1045,6 +1045,7 @@ pub struct AuthorizationManager {
     legacy_discovery_fallback: AtomicBool,
     resource_policy: OAuthResourcePolicy,
     refresh_resource_policy: OAuthRefreshResourcePolicy,
+    configured_client_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1294,6 +1295,7 @@ impl AuthorizationManager {
             legacy_discovery_fallback: AtomicBool::new(false),
             resource_policy: OAuthResourcePolicy::Endpoint,
             refresh_resource_policy: OAuthRefreshResourcePolicy::Include,
+            configured_client_secret: None,
         };
 
         Ok(manager)
@@ -1510,6 +1512,52 @@ impl AuthorizationManager {
         Ok((client_id.to_string(), token_response))
     }
 
+    /// Adopt externally persisted credentials as one coherent OAuth identity.
+    ///
+    /// The configured client, optional confidential secret, stored token, and
+    /// granted scopes are updated together. Credentials bound to a different
+    /// authorization-server issuer are rejected before any state is changed.
+    pub async fn adopt_credentials(
+        &mut self,
+        credentials: StoredCredentials,
+        client_secret: Option<String>,
+    ) -> Result<(), AuthError> {
+        if let (Some(stored_issuer), Some(current_issuer)) =
+            (credentials.issuer.as_deref(), self.metadata_issuer())
+            && stored_issuer != current_issuer
+        {
+            return Err(AuthError::AuthorizationServerMismatch {
+                expected_issuer: current_issuer,
+                received_issuer: stored_issuer.to_string(),
+            });
+        }
+
+        let config = OAuthClientConfig {
+            client_id: credentials.client_id.clone(),
+            client_secret,
+            scopes: credentials.granted_scopes.clone(),
+            redirect_uri: self.base_url.to_string(),
+            application_type: None,
+        };
+        let previous_client = self.oauth_client.clone();
+        let previous_secret = self.configured_client_secret.clone();
+        self.configure_client(config)?;
+
+        if let Err(error) = self.credential_store.save(credentials.clone()).await {
+            self.oauth_client = previous_client;
+            self.configured_client_secret = previous_secret;
+            return Err(error);
+        }
+
+        *self.current_scopes.write().await = credentials.granted_scopes;
+        Ok(())
+    }
+
+    /// Return the confidential secret associated with the configured client.
+    pub fn configured_client_secret(&self) -> Option<&str> {
+        self.configured_client_secret.as_deref()
+    }
+
     /// configure oauth2 client with client credentials
     pub fn configure_client(&mut self, config: OAuthClientConfig) -> Result<(), AuthError> {
         if self.metadata.is_none() {
@@ -1538,6 +1586,7 @@ impl AuthorizationManager {
             .set_token_uri(token_url)
             .set_redirect_uri(redirect_url);
 
+        let configured_client_secret = config.client_secret.clone();
         if let Some(secret) = config.client_secret {
             client_builder = client_builder.set_client_secret(ClientSecret::new(secret));
         }
@@ -1560,6 +1609,7 @@ impl AuthorizationManager {
         }
 
         self.oauth_client = Some(client_builder);
+        self.configured_client_secret = configured_client_secret;
         Ok(())
     }
     /// validate authorization server metadata before starting authorization.
@@ -3977,7 +4027,7 @@ mod tests {
         sync::{Arc, Mutex as StdMutex},
     };
 
-    use oauth2::{AuthType, CsrfToken, HttpResponse, PkceCodeVerifier};
+    use oauth2::{AuthType, CsrfToken, HttpResponse, PkceCodeVerifier, TokenResponse};
     use rstest::rstest;
     use url::Url;
 
@@ -6336,6 +6386,131 @@ mod tests {
         let credentials_cleared = store.load().await.unwrap().is_none();
 
         assert_eq!((initialized, credentials_cleared), (false, true));
+    }
+
+    #[tokio::test]
+    async fn adopt_credentials_restores_client_secret_tokens_and_granted_scopes_together() {
+        let mut manager = manager_with_metadata(Some(AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            issuer: Some("https://auth.example.com".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        let credentials = StoredCredentials {
+            client_id: "confidential-client".to_string(),
+            token_response: Some(make_token_response("persisted-token", Some(3600))),
+            granted_scopes: vec!["read".to_string(), "write".to_string()],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: Some("https://auth.example.com".to_string()),
+        };
+
+        manager
+            .adopt_credentials(credentials, Some("persisted-secret".to_string()))
+            .await
+            .unwrap();
+        let (client_id, token) = manager.get_credentials().await.unwrap();
+
+        assert_eq!(
+            (
+                client_id,
+                token
+                    .as_ref()
+                    .map(|token| token.access_token().secret().as_str()),
+                manager.configured_client_secret(),
+                manager.get_current_scopes().await,
+            ),
+            (
+                "confidential-client".to_string(),
+                Some("persisted-token"),
+                Some("persisted-secret"),
+                vec!["read".to_string(), "write".to_string()],
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_credentials_rejects_issuer_mismatch_without_mutating_state() {
+        let mut manager = manager_with_metadata(Some(AuthorizationMetadata {
+            authorization_endpoint: "https://new.example.com/authorize".to_string(),
+            token_endpoint: "https://new.example.com/token".to_string(),
+            issuer: Some("https://new.example.com".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        let credentials = StoredCredentials {
+            client_id: "old-client".to_string(),
+            token_response: Some(make_token_response("old-token", Some(3600))),
+            granted_scopes: vec!["read".to_string()],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: Some("https://old.example.com".to_string()),
+        };
+
+        let error = manager
+            .adopt_credentials(credentials, Some("old-secret".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AuthError::AuthorizationServerMismatch { .. }
+        ));
+        assert_eq!(
+            (
+                manager.oauth_client.is_none(),
+                manager.configured_client_secret(),
+                manager.get_current_scopes().await,
+                manager.credential_store.load().await.unwrap().is_none(),
+            ),
+            (true, None, Vec::<String>::new(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_credentials_rolls_back_client_identity_when_persistence_fails() {
+        struct FailingCredentialStore;
+
+        #[async_trait::async_trait]
+        impl CredentialStore for FailingCredentialStore {
+            async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+                Ok(None)
+            }
+
+            async fn save(&self, _credentials: StoredCredentials) -> Result<(), AuthError> {
+                Err(AuthError::InternalError(
+                    "credential storage failed".to_string(),
+                ))
+            }
+
+            async fn clear(&self) -> Result<(), AuthError> {
+                Ok(())
+            }
+        }
+
+        let mut manager = manager_with_metadata(None).await;
+        manager.set_credential_store(FailingCredentialStore);
+        let credentials = StoredCredentials {
+            client_id: "confidential-client".to_string(),
+            token_response: Some(make_token_response("persisted-token", Some(3600))),
+            granted_scopes: vec!["read".to_string()],
+            token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+            issuer: None,
+        };
+
+        let error = manager
+            .adopt_credentials(credentials, Some("persisted-secret".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AuthError::InternalError(_)));
+        assert_eq!(
+            (
+                manager.oauth_client.is_none(),
+                manager.configured_client_secret(),
+                manager.get_current_scopes().await,
+            ),
+            (true, None, Vec::<String>::new())
+        );
     }
 
     fn test_client_config() -> OAuthClientConfig {
