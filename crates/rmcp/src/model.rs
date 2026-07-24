@@ -4478,7 +4478,8 @@ impl ServerResult {
         protocol_version: &ProtocolVersion,
     ) -> Result<Value, serde_json::Error> {
         let mut value = serde_json::to_value(self)?;
-        if protocol_version < &ProtocolVersion::V_2026_07_28
+        if !matches!(self, ServerResult::DiscoverResult(_))
+            && protocol_version < &ProtocolVersion::V_2026_07_28
             && let Some(result) = value.as_object_mut()
             && result
                 .get("resultType")
@@ -4499,7 +4500,9 @@ impl ServerResult {
         self,
         protocol_version: &ProtocolVersion,
     ) -> Result<Self, serde_json::Error> {
-        if protocol_version >= &ProtocolVersion::V_2026_07_28 {
+        if protocol_version >= &ProtocolVersion::V_2026_07_28
+            || matches!(self, ServerResult::DiscoverResult(_))
+        {
             return Ok(self);
         }
 

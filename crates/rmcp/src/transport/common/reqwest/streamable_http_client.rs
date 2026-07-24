@@ -192,6 +192,13 @@ impl StreamableHttpClient for reqwest::Client {
                     www_authenticate_header: header,
                 }));
             }
+            // Authentication failures must retain their HTTP meaning even
+            // when the server includes a JSON-RPC error body. In particular,
+            // Auto lifecycle negotiation must never interpret a 401 as a
+            // legacy-protocol rejection and silently downgrade.
+            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                format!("HTTP {}: authentication required", response.status()),
+            )));
         }
         if response.status() == reqwest::StatusCode::FORBIDDEN {
             if let Some(header) = response.headers().get(WWW_AUTHENTICATE) {
@@ -208,6 +215,11 @@ impl StreamableHttpClient for reqwest::Client {
                     },
                 ));
             }
+            // A 403 is likewise an authorization decision, not evidence that
+            // the endpoint only supports legacy initialization.
+            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                format!("HTTP {}: access forbidden", response.status()),
+            )));
         }
         let status = response.status();
         if matches!(

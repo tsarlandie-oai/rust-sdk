@@ -51,6 +51,12 @@ impl ServiceRole for RoleServer {
     }
 
     fn response_protocol_version(context: &RequestContext<Self>) -> Option<ProtocolVersion> {
+        if !context.peer.request_metadata_required()
+            && let Some(peer_info) = context.peer.peer_info()
+        {
+            return Some(peer_info.protocol_version.clone());
+        }
+
         context.protocol_version()
     }
 

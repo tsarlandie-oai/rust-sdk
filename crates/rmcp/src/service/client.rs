@@ -629,13 +629,36 @@ impl DiscoverStartupError {
                     return false;
                 }
 
-                let supported = error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("supported"))
-                    .cloned()
-                    .and_then(|value| serde_json::from_value::<Vec<ProtocolVersion>>(value).ok())
-                    .or_else(|| historical_versions_from_message(normalized_message));
+                let supported_data = error.data.as_ref().and_then(|data| data.get("supported"));
+                let supported_from_data = match supported_data {
+                    Some(value) => {
+                        let Ok(versions) =
+                            serde_json::from_value::<Vec<ProtocolVersion>>(value.clone())
+                        else {
+                            return false;
+                        };
+                        Some(versions)
+                    }
+                    None => None,
+                };
+                let supported_from_message = historical_versions_from_message(normalized_message);
+                if normalized_message.contains("supported versions:")
+                    && supported_from_message.is_none()
+                {
+                    return false;
+                }
+
+                let supported = match (supported_from_data, supported_from_message) {
+                    (Some(data), Some(message))
+                        if data.len() == message.len()
+                            && data.iter().all(|version| message.contains(version)) =>
+                    {
+                        Some(data)
+                    }
+                    (Some(_), Some(_)) => None,
+                    (Some(versions), None) | (None, Some(versions)) => Some(versions),
+                    (None, None) => None,
+                };
 
                 supported
                     .as_deref()
@@ -658,20 +681,29 @@ fn exclusively_historical_protocol_versions(versions: &[ProtocolVersion]) -> boo
 
 fn historical_versions_from_message(message: &str) -> Option<Vec<ProtocolVersion>> {
     let (_, supported_versions) = message.split_once("supported versions:")?;
-    let versions = supported_versions
-        .split(|character: char| !character.is_ascii_digit() && character != '-')
-        .filter(|candidate| {
-            candidate.len() == 10
-                && candidate.as_bytes().get(4) == Some(&b'-')
-                && candidate.as_bytes().get(7) == Some(&b'-')
-        })
-        .filter_map(|candidate| {
-            serde_json::from_value::<ProtocolVersion>(serde_json::Value::String(
-                candidate.to_owned(),
-            ))
-            .ok()
-        })
-        .collect::<Vec<_>>();
+    let supported_versions = supported_versions.split(')').next()?;
+    let mut versions = Vec::new();
+    for candidate in supported_versions.split(',') {
+        let candidate = candidate
+            .trim()
+            .trim_matches(|character| matches!(character, '[' | ']' | '"' | '\''));
+        let bytes = candidate.as_bytes();
+        if bytes.len() != 10
+            || bytes.get(4) != Some(&b'-')
+            || bytes.get(7) != Some(&b'-')
+            || bytes
+                .iter()
+                .enumerate()
+                .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let version = serde_json::from_value::<ProtocolVersion>(serde_json::Value::String(
+            candidate.to_owned(),
+        ))
+        .ok()?;
+        versions.push(version);
+    }
 
     (!versions.is_empty()).then_some(versions)
 }
@@ -866,15 +898,7 @@ where
     let (response, response_id) =
         match expect_response(transport, "initialize response", service, peer.clone()).await? {
             StartupResponse::Response(response, response_id) => (response, response_id),
-            StartupResponse::Error(error, response_id) => {
-                if let Some(response_id) = response_id
-                    && !id.matches_response_id(&response_id)
-                {
-                    return Err(ClientInitializeError::ConflictInitResponseId(
-                        id,
-                        response_id,
-                    ));
-                }
+            StartupResponse::Error(error, _) => {
                 return Err(ClientInitializeError::JsonRpcError(error));
             }
         };

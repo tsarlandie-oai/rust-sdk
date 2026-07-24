@@ -448,6 +448,55 @@ async fn auto_startup_does_not_fall_back_for_unknown_or_future_protocol_versions
 }
 
 #[tokio::test]
+async fn auto_startup_does_not_fall_back_for_unknown_protocol_version_tokens() {
+    let error = assert_auto_startup_does_not_fall_back(|_| {
+        ServerJsonRpcMessage::error(
+            ErrorData::new(
+                ErrorCode(-32000),
+                "Bad Request: Unsupported protocol version: 2026-07-28 \
+                 (supported versions: 2025-06-18, next-draft)",
+                None,
+            ),
+            None,
+        )
+    })
+    .await;
+    assert!(matches!(error, ClientInitializeError::JsonRpcError(_)));
+}
+
+#[tokio::test]
+async fn auto_startup_does_not_fall_back_for_contradictory_supported_versions() {
+    let error = assert_auto_startup_does_not_fall_back(|_| {
+        ServerJsonRpcMessage::error(
+            ErrorData::new(
+                ErrorCode(-32000),
+                "Bad Request: Unsupported protocol version: 2026-07-28 \
+                 (supported versions: 2025-06-18, 2027-01-01)",
+                Some(serde_json::json!({ "supported": ["2025-06-18"] })),
+            ),
+            None,
+        )
+    })
+    .await;
+    assert!(matches!(error, ClientInitializeError::JsonRpcError(_)));
+}
+
+#[tokio::test]
+async fn auto_startup_does_not_fall_back_for_uncorrelated_protocol_version_error() {
+    let error = assert_auto_startup_does_not_fall_back(|_| {
+        ServerJsonRpcMessage::error(
+            ErrorData::unsupported_protocol_version(
+                ProtocolVersion::V_2026_07_28,
+                &[ProtocolVersion::V_2025_06_18],
+            ),
+            None,
+        )
+    })
+    .await;
+    assert!(matches!(error, ClientInitializeError::JsonRpcError(_)));
+}
+
+#[tokio::test]
 async fn discover_startup_retries_a_mutually_supported_version() {
     let unsupported: ProtocolVersion =
         serde_json::from_value(serde_json::json!("2099-01-01")).unwrap();

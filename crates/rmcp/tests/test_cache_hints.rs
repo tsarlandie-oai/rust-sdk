@@ -1,6 +1,7 @@
 use rmcp::model::{
-    CacheScope, CallToolResult, CustomResult, ListToolsResult, ProtocolVersion, ReadResourceResult,
-    ResourceContents, ResultType, ServerResult,
+    CacheScope, CallToolResult, CustomResult, DiscoverResult, Implementation, ListToolsResult,
+    ProtocolVersion, ReadResourceResult, ResourceContents, ResultType, ServerCapabilities,
+    ServerResult,
 };
 use serde_json::json;
 
@@ -148,4 +149,23 @@ fn legacy_results_without_discriminator_deserialize_as_complete() {
     .expect("legacy tool result should deserialize");
 
     assert_eq!(result.result_type, ResultType::COMPLETE);
+}
+
+#[test]
+fn discovery_preserves_result_discriminator_for_legacy_version_candidates() {
+    let result = ServerResult::DiscoverResult(DiscoverResult::new(
+        vec![ProtocolVersion::V_2025_11_25],
+        ServerCapabilities::default(),
+        Implementation::new("discovery-server", "1.0.0"),
+    ));
+
+    let actual = result
+        .to_value_for_protocol(&ProtocolVersion::V_2025_11_25)
+        .expect("discovery result should serialize");
+    assert_eq!(actual["resultType"], "complete");
+
+    let adapted = result
+        .into_result_for_protocol(&ProtocolVersion::V_2025_11_25)
+        .expect("discovery result should preserve its type");
+    assert!(matches!(adapted, ServerResult::DiscoverResult(_)));
 }

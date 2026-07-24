@@ -157,6 +157,8 @@ enum LegacyDiscoveryRejection {
     MethodNotAllowed,
     Unauthorized,
     Forbidden,
+    UnauthorizedJson,
+    ForbiddenJson,
 }
 
 #[derive(Clone)]
@@ -218,6 +220,29 @@ async fn legacy_prevalidation_handler(
             LegacyDiscoveryRejection::Forbidden => {
                 (StatusCode::FORBIDDEN, "access forbidden").into_response()
             }
+            LegacyDiscoveryRejection::UnauthorizedJson => json_response(
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32000,
+                        "message": "Bad Request: No valid session ID provided",
+                    },
+                }),
+            ),
+            LegacyDiscoveryRejection::ForbiddenJson => json_response(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32000,
+                        "message": "Bad Request: Unsupported protocol version: 2026-07-28 \
+                            (supported versions: 2025-11-25, 2025-06-18)",
+                    },
+                }),
+            ),
         },
         "initialize" => {
             assert_eq!(
@@ -383,4 +408,14 @@ async fn auto_http_client_does_not_downgrade_after_http_401() {
 #[tokio::test]
 async fn auto_http_client_does_not_downgrade_after_http_403() {
     assert_http_auth_rejection_does_not_downgrade(LegacyDiscoveryRejection::Forbidden).await;
+}
+
+#[tokio::test]
+async fn auto_http_client_does_not_downgrade_after_json_rpc_http_401() {
+    assert_http_auth_rejection_does_not_downgrade(LegacyDiscoveryRejection::UnauthorizedJson).await;
+}
+
+#[tokio::test]
+async fn auto_http_client_does_not_downgrade_after_json_rpc_http_403() {
+    assert_http_auth_rejection_does_not_downgrade(LegacyDiscoveryRejection::ForbiddenJson).await;
 }
