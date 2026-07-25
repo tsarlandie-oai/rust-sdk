@@ -592,7 +592,8 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(StreamableHttpError::UnexpectedServerResponse(_))
+                Err(StreamableHttpError::UnexpectedHttpStatus { status, .. })
+                    if status == StatusCode::TEMPORARY_REDIRECT.as_u16()
             ),
             "redirect response should be returned to the transport, got {result:?}"
         );
