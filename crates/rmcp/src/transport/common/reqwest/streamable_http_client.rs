@@ -219,6 +219,22 @@ impl StreamableHttpClient for reqwest::Client {
         if status == reqwest::StatusCode::NOT_FOUND && session_was_attached {
             return Err(StreamableHttpError::SessionExpired);
         }
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            return Err(StreamableHttpError::UnexpectedHttpStatus {
+                status: status.as_u16(),
+                body: Cow::Owned(body),
+            });
+        }
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -262,9 +278,10 @@ impl StreamableHttpClient for reqwest::Client {
                     ),
                 }
             }
-            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
-            )));
+            return Err(StreamableHttpError::UnexpectedHttpStatus {
+                status: status.as_u16(),
+                body: Cow::Owned(body),
+            });
         }
         match content_type.as_deref() {
             Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
