@@ -122,14 +122,20 @@ async fn discover_returns_server_metadata_without_session() {
             "resultType": "complete",
             "supportedVersions": ["2025-11-25"],
             "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "discovery-server",
-                "version": "1.0.0"
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "discovery-server",
+                    "version": "1.0.0"
+                }
             },
             "instructions": "Use the tools carefully",
             "ttlMs": 0,
             "cacheScope": "private"
         })
+    );
+    assert!(
+        body["result"].get("serverInfo").is_none(),
+        "discovery server identity must only be emitted in namespaced metadata"
     );
 
     cancellation_token.cancel();
