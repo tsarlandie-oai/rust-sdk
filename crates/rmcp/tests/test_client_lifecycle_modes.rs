@@ -338,6 +338,209 @@ async fn auto_startup_falls_back_after_discover_method_not_found() {
 }
 
 #[tokio::test]
+async fn auto_startup_falls_back_after_legacy_json_rpc_rejections() {
+    for (name, code) in [
+        ("invalid request", ErrorCode::INVALID_REQUEST),
+        ("invalid params", ErrorCode::INVALID_PARAMS),
+    ] {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let mut server = IntoTransport::<rmcp::RoleServer, _, _>::into_transport(server_transport);
+        let server_task = tokio::spawn(async move {
+            let ClientJsonRpcMessage::Request(discover) =
+                server.receive().await.expect("expected discover request")
+            else {
+                panic!("expected discover request");
+            };
+            server
+                .send(ServerJsonRpcMessage::error(
+                    ErrorData::new(code, "legacy server rejected the discovery probe", None),
+                    Some(discover.id),
+                ))
+                .await
+                .expect("send discovery rejection");
+
+            let ClientJsonRpcMessage::Request(initialize) =
+                server.receive().await.expect("expected initialize request")
+            else {
+                panic!("expected initialize request");
+            };
+            assert!(matches!(
+                initialize.request,
+                ClientRequest::InitializeRequest(_)
+            ));
+            server
+                .send(ServerJsonRpcMessage::response(
+                    ServerResult::InitializeResult(InitializeResult::new(
+                        ServerCapabilities::default(),
+                    )),
+                    initialize.id,
+                ))
+                .await
+                .expect("send initialize response");
+            assert!(matches!(
+                server.receive().await,
+                Some(ClientJsonRpcMessage::Notification(_))
+            ));
+        });
+
+        let client = DiscoverClient
+            .serve_with_lifecycle(
+                client_transport,
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{name} should permit legacy startup: {error}"));
+        client.cancel().await.expect("cancel client");
+        server_task.await.expect("server task");
+    }
+}
+
+#[tokio::test]
+async fn auto_startup_falls_back_after_legacy_only_discovery_result() {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let mut server = IntoTransport::<rmcp::RoleServer, _, _>::into_transport(server_transport);
+    let server_task = tokio::spawn(async move {
+        let ClientJsonRpcMessage::Request(discover) =
+            server.receive().await.expect("expected discover request")
+        else {
+            panic!("expected discover request");
+        };
+        server
+            .send(ServerJsonRpcMessage::response(
+                ServerResult::DiscoverResult(DiscoverResult::new(
+                    vec![ProtocolVersion::V_2025_11_25],
+                    ServerCapabilities::default(),
+                )),
+                discover.id,
+            ))
+            .await
+            .expect("send legacy-only discovery result");
+
+        let ClientJsonRpcMessage::Request(initialize) =
+            server.receive().await.expect("expected initialize request")
+        else {
+            panic!("expected initialize request");
+        };
+        server
+            .send(ServerJsonRpcMessage::response(
+                ServerResult::InitializeResult(
+                    InitializeResult::new(ServerCapabilities::default()),
+                ),
+                initialize.id,
+            ))
+            .await
+            .expect("send initialize response");
+        assert!(matches!(
+            server.receive().await,
+            Some(ClientJsonRpcMessage::Notification(_))
+        ));
+    });
+
+    let client = DiscoverClient
+        .serve_with_lifecycle(
+            client_transport,
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            },
+        )
+        .await
+        .expect("legacy-only discovery result should permit legacy startup");
+    client.cancel().await.expect("cancel client");
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn auto_startup_rejects_unrelated_discovery_response_ids() {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let mut server = IntoTransport::<rmcp::RoleServer, _, _>::into_transport(server_transport);
+    let server_task = tokio::spawn(async move {
+        let ClientJsonRpcMessage::Request(_) =
+            server.receive().await.expect("expected discover request")
+        else {
+            panic!("expected discover request");
+        };
+        server
+            .send(ServerJsonRpcMessage::error(
+                ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not found", None),
+                Some(RequestId::Number(99)),
+            ))
+            .await
+            .expect("send unrelated discovery rejection");
+    });
+
+    let error = match DiscoverClient
+        .serve_with_lifecycle(
+            client_transport,
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            },
+        )
+        .await
+    {
+        Ok(client) => {
+            let _ = client.cancel().await;
+            panic!("unrelated discovery responses must not downgrade")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            rmcp::service::ClientInitializeError::ConflictInitResponseId(..)
+        ),
+        "unexpected error for unrelated discovery response: {error}"
+    );
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn auto_startup_rejects_null_discovery_response_ids() {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let mut server = IntoTransport::<rmcp::RoleServer, _, _>::into_transport(server_transport);
+    let server_task = tokio::spawn(async move {
+        let ClientJsonRpcMessage::Request(_) =
+            server.receive().await.expect("expected discover request")
+        else {
+            panic!("expected discover request");
+        };
+        server
+            .send(ServerJsonRpcMessage::error(
+                ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not found", None),
+                None,
+            ))
+            .await
+            .expect("send uncorrelated discovery rejection");
+    });
+
+    let error = match DiscoverClient
+        .serve_with_lifecycle(
+            client_transport,
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            },
+        )
+        .await
+    {
+        Ok(client) => {
+            let _ = client.cancel().await;
+            panic!("null-ID discovery responses must not downgrade")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("did not match its request ID"),
+        "uncorrelated discovery response must explain the missing response ID: {error}"
+    );
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn discover_startup_retries_a_mutually_supported_version() {
     let unsupported: ProtocolVersion =
         serde_json::from_value(serde_json::json!("2099-01-01")).unwrap();

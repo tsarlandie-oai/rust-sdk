@@ -12,7 +12,8 @@ use axum::{
 use http::{HeaderName, HeaderValue};
 use hyper_util::rt::TokioIo;
 use rmcp::{
-    ServiceExt,
+    ClientLifecycleMode, ClientServiceExt, ServiceExt,
+    model::{ClientInfo, ProtocolVersion},
     transport::{
         StreamableHttpClientTransport, UnixSocketHttpClient,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -294,5 +295,96 @@ async fn test_unix_socket_convenience_constructor() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_dir(&dir);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn unix_socket_auto_lifecycle_handles_legacy_http_prevalidation() -> anyhow::Result<()> {
+    let directory = std::env::temp_dir().join(format!(
+        "rmcp-unix-discovery-fallback-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory)?;
+    let socket_path = directory.join("mcp.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let observed_methods = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = Arc::clone(&observed_methods);
+    let app = Router::new().route(
+        "/mcp",
+        post(move |body: Bytes| {
+            let observed = Arc::clone(&observed);
+            async move {
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("parse JSON-RPC request");
+                let method = request["method"].as_str().expect("JSON-RPC method");
+                observed.lock().await.push(method.to_string());
+
+                match method {
+                    "server/discover" => axum::http::Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(axum::body::Body::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": null,
+                                "error": {
+                                    "code": -32000,
+                                    "message": "Bad Request: No valid session ID provided"
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .expect("build legacy prevalidation response"),
+                    "initialize" => axum::http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": {},
+                                    "serverInfo": {"name":"legacy-unix", "version":"1.0"}
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .expect("build initialize response"),
+                    "notifications/initialized" => axum::http::Response::builder()
+                        .status(StatusCode::ACCEPTED)
+                        .body(axum::body::Body::empty())
+                        .expect("build initialized response"),
+                    other => panic!("unexpected JSON-RPC method {other}"),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let server = spawn_unix_server(listener, app);
+    let uri = "http://mcp-server.internal/mcp";
+    let transport = StreamableHttpClientTransport::with_client(
+        UnixSocketHttpClient::new(socket_path.to_str().expect("socket path"), uri),
+        StreamableHttpClientTransportConfig::with_uri(uri),
+    );
+
+    let client = ClientInfo::default()
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_06_18),
+            },
+        )
+        .await?;
+    client.cancel().await?;
+    assert_eq!(
+        *observed_methods.lock().await,
+        ["server/discover", "initialize", "notifications/initialized"]
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_dir(&directory);
     Ok(())
 }

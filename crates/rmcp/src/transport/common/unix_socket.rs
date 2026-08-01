@@ -10,7 +10,7 @@ use sse_stream::Sse;
 use tokio::net::UnixStream;
 
 use crate::{
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
     transport::{
         common::{
             client_side_sse::{DEFAULT_MAX_SSE_EVENT_SIZE, bounded_sse_stream},
@@ -192,6 +192,11 @@ impl StreamableHttpClient for UnixSocketHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let is_discovery_request = matches!(
+            &message,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, ClientRequest::DiscoverRequest(_))
+        );
         let json_body = serde_json::to_string(&message)
             .map_err(|e| StreamableHttpError::Client(UnixSocketError::Json(e)))?;
 
@@ -274,6 +279,19 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                 .await
                 .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
                 .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            if is_discovery_request {
+                if status == StatusCode::BAD_REQUEST
+                    && let Ok(message @ JsonRpcMessage::Error(_)) =
+                        serde_json::from_str::<ServerJsonRpcMessage>(&body)
+                    && let JsonRpcMessage::Error(error) = &message
+                    && error.id.is_some()
+                {
+                    return Ok(StreamableHttpPostResponse::Json(message, None));
+                }
+                return Err(StreamableHttpError::UnexpectedHttpStatus(
+                    HttpStatusError::new(status.as_u16(), body),
+                ));
+            }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                 format!("HTTP {status}: {body}"),
             )));

@@ -169,6 +169,30 @@ impl InsufficientScopeError {
     }
 }
 
+/// A non-success HTTP response preserved for transport-independent inspection.
+///
+/// HTTP clients should return this error for an initial `server/discover`
+/// rejection that cannot be represented as a correlated JSON-RPC response.
+/// Automatic lifecycle negotiation can then inspect the original status and
+/// body without guessing the concrete HTTP client implementation.
+#[derive(Debug, Error)]
+#[error("unexpected HTTP status {status}: {body}")]
+#[non_exhaustive]
+pub struct HttpStatusError {
+    pub status: u16,
+    pub body: Cow<'static, str>,
+}
+
+impl HttpStatusError {
+    /// Preserve an HTTP status and its response body.
+    pub fn new(status: u16, body: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
@@ -182,6 +206,8 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     UnexpectedEndOfStream,
     #[error("unexpected server response: {0}")]
     UnexpectedServerResponse(Cow<'static, str>),
+    #[error("{0}")]
+    UnexpectedHttpStatus(#[source] HttpStatusError),
     #[error("Unexpected content type: {0:?}")]
     UnexpectedContentType(Option<String>),
     #[error("Server does not support SSE")]
@@ -272,7 +298,10 @@ impl StreamableHttpPostResponse {
 
                     let message: ServerJsonRpcMessage = serde_json::from_str(&payload)?;
 
-                    if matches!(message, ServerJsonRpcMessage::Response(_)) {
+                    if matches!(
+                        message,
+                        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+                    ) {
                         return Ok((message, session_id));
                     }
 
@@ -325,6 +354,12 @@ impl StreamableHttpPostResponse {
 /// [`Self::post_message_with_max_sse_event_size`] and
 /// [`Self::get_stream_with_max_sse_event_size`] to enforce the transport's
 /// configured event-size limit.
+///
+/// For an initial `server/discover` HTTP rejection that does not carry a
+/// correlated JSON-RPC response, return
+/// [`StreamableHttpError::UnexpectedHttpStatus`] with the original status and
+/// body. Automatic client lifecycle negotiation can then decide whether to
+/// retry a legacy `initialize` handshake.
 pub trait StreamableHttpClient: Clone + Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     fn post_message(
@@ -841,54 +876,85 @@ impl<C: StreamableHttpClient> Worker for StreamableHttpClientWorker<C> {
         let config = self.config.clone();
         let transport_task_ct = context.cancellation_token.clone();
         let _drop_guard = transport_task_ct.clone().drop_guard();
-        let WorkerSendRequest {
-            responder,
-            message: startup_request,
-        } = context.recv_from_handler().await?;
-        let is_legacy_startup = matches!(
-            &startup_request,
-            ClientJsonRpcMessage::Request(request)
-                if matches!(&request.request, ClientRequest::InitializeRequest(_))
-        );
-        let mut saved_init_request = is_legacy_startup.then(|| startup_request.clone());
         let empty_tool_cache = HashMap::new();
-        let (bootstrap_version, bootstrap_headers) = if is_legacy_startup {
-            (ProtocolVersion::default(), config.custom_headers.clone())
-        } else {
-            request_version_headers(
-                &config.custom_headers,
+        let (
+            startup_request,
+            is_legacy_startup,
+            bootstrap_version,
+            bootstrap_headers,
+            message,
+            session_id,
+        ) = loop {
+            let WorkerSendRequest {
+                responder,
+                message: startup_request,
+            } = context.recv_from_handler().await?;
+            let is_legacy_startup = matches!(
                 &startup_request,
-                &ProtocolVersion::default(),
-                &empty_tool_cache,
-            )
-        };
-        let (message, session_id) = match self
-            .client
-            .post_message_with_max_sse_event_size(
-                config.uri.clone(),
-                startup_request,
-                None,
-                config.auth_header.clone(),
-                bootstrap_headers.clone(),
-                config.max_sse_event_size,
-            )
-            .await
-        {
-            Ok(res) => {
-                let _ = responder.send(Ok(()));
-                res.expect_initialized::<C::Error>().await.map_err(
-                    WorkerQuitReason::fatal_context("process initialize response"),
-                )?
+                ClientJsonRpcMessage::Request(request)
+                    if matches!(&request.request, ClientRequest::InitializeRequest(_))
+            );
+            let is_discovery_startup = matches!(
+                &startup_request,
+                ClientJsonRpcMessage::Request(request)
+                    if matches!(&request.request, ClientRequest::DiscoverRequest(_))
+            );
+            let (bootstrap_version, bootstrap_headers) = if is_legacy_startup {
+                (ProtocolVersion::default(), config.custom_headers.clone())
+            } else {
+                request_version_headers(
+                    &config.custom_headers,
+                    &startup_request,
+                    &ProtocolVersion::default(),
+                    &empty_tool_cache,
+                )
+            };
+            match self
+                .client
+                .post_message_with_max_sse_event_size(
+                    config.uri.clone(),
+                    startup_request.clone(),
+                    None,
+                    config.auth_header.clone(),
+                    bootstrap_headers.clone(),
+                    config.max_sse_event_size,
+                )
+                .await
+            {
+                Ok(response) => {
+                    let _ = responder.send(Ok(()));
+                    let (message, session_id) =
+                        response.expect_initialized::<C::Error>().await.map_err(
+                            WorkerQuitReason::fatal_context("process initialize response"),
+                        )?;
+                    break (
+                        startup_request,
+                        is_legacy_startup,
+                        bootstrap_version,
+                        bootstrap_headers,
+                        message,
+                        session_id,
+                    );
+                }
+                Err(error @ StreamableHttpError::UnexpectedHttpStatus(_))
+                    if is_discovery_startup =>
+                {
+                    // Discovery prevalidation is recoverable. Auto mode
+                    // inspects the typed response and may send initialize
+                    // through this still-live worker.
+                    let _ = responder.send(Err(error));
+                }
+                Err(error) => {
+                    let message = format!("{error:?}");
+                    let _ = responder.send(Err(error));
+                    return Err(WorkerQuitReason::fatal(
+                        StreamableHttpError::TransportChannelClosed,
+                        message,
+                    ));
+                }
             }
-            Err(err) => {
-                let msg = format!("{:?}", err);
-                let _ = responder.send(Err(err));
-                return Err(WorkerQuitReason::fatal(
-                    StreamableHttpError::TransportChannelClosed,
-                    msg,
-                ));
-            }
         };
+        let mut saved_init_request = is_legacy_startup.then(|| startup_request.clone());
         let mut uses_modern_http = !is_legacy_startup;
         let mut session_id: Option<Arc<str>> = if uses_modern_http {
             None

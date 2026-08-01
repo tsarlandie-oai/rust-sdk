@@ -6,7 +6,7 @@ use reqwest::header::ACCEPT;
 use sse_stream::Sse;
 
 use crate::{
-    model::{ClientJsonRpcMessage, JsonRpcMessage, ServerJsonRpcMessage},
+    model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
     transport::{
         common::{
             client_side_sse::{DEFAULT_MAX_SSE_EVENT_SIZE, bounded_sse_stream},
@@ -165,6 +165,11 @@ impl StreamableHttpClient for reqwest::Client {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let is_discovery_request = matches!(
+            &message,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, ClientRequest::DiscoverRequest(_))
+        );
         let mut request = self
             .post(uri.as_ref())
             .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
@@ -249,6 +254,18 @@ impl StreamableHttpClient for reqwest::Client {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            if is_discovery_request {
+                if status == reqwest::StatusCode::BAD_REQUEST
+                    && let Some(message @ JsonRpcMessage::Error(_)) = parse_json_rpc_error(&body)
+                    && let JsonRpcMessage::Error(error) = &message
+                    && error.id.is_some()
+                {
+                    return Ok(StreamableHttpPostResponse::Json(message, session_id));
+                }
+                return Err(StreamableHttpError::UnexpectedHttpStatus(
+                    HttpStatusError::new(status.as_u16(), body),
+                ));
+            }
             if content_type
                 .as_deref()
                 .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
