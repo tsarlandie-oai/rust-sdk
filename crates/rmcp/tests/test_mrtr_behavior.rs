@@ -192,6 +192,33 @@ impl MrtrServer {
             },
             // Never completes: used to exercise the max-rounds cap.
             "loops" => Ok(single_elicitation("loop").into()),
+            "file_upload" => match responses {
+                None => {
+                    let request = serde_json::from_value(json!({
+                        "method": "io.modelcontextprotocol/files/upload",
+                        "params": { "files": [{
+                            "fileId": "f-1", "url": "https://upload.example/test?sig=sensitive",
+                            "headers": { "x-upload-key": "secret-header" }, "credentials": "omit"
+                        }] }
+                    }))
+                    .unwrap();
+                    Ok(InputRequiredResult::new(
+                        Some(InputRequests::from([("uploads".to_owned(), request)])),
+                        Some(TRICKY_STATE.into()),
+                    )
+                    .into())
+                }
+                Some(map)
+                    if state == Some(TRICKY_STATE)
+                        && map.get("uploads")
+                            == Some(&json!({
+                                "resultType": "complete", "files": [{"fileId": "f-1", "status": "completed"}]
+                            })) =>
+                {
+                    Ok(CallToolResult::success(vec![ContentBlock::text("saved")]).into())
+                }
+                _ => Err(ErrorData::invalid_params("invalid continuation", None)),
+            },
             // Triggers a failure inside the client's elicitation handler.
             "handler_error" => {
                 let mut requests = InputRequests::new();
@@ -480,6 +507,78 @@ async fn state_only_input_required_completes() -> anyhow::Result<()> {
         Ok(())
     })
     .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn extension_input_is_preserved_for_manual_fulfillment() -> anyhow::Result<()> {
+    let server = MrtrServer::default();
+    let calls = server.calls.clone();
+    with_pair(server, ProtocolVersion::V_2026_07_28, |client| async move {
+        let mut params = CallToolRequestParams::new("file_upload");
+        let CallToolResponse::InputRequired(result) = client.call_tool_once(params.clone()).await?
+        else {
+            anyhow::bail!("expected the input_required result")
+        };
+        let inputs = result.input_requests.unwrap();
+        let InputRequest::Custom(request) = &inputs["uploads"] else {
+            anyhow::bail!("expected an extension input")
+        };
+        assert_eq!(request.method(), "io.modelcontextprotocol/files/upload");
+        let files = &request.params.as_ref().unwrap()["files"];
+        assert_eq!(files[0]["fileId"], "f-1");
+        assert_eq!(files[0]["headers"]["x-upload-key"], "secret-header");
+        assert_eq!(files[0]["url"], "https://upload.example/test?sig=sensitive");
+        let debug = format!("{inputs:?}");
+        assert!(!debug.contains("sensitive"));
+        assert!(!debug.contains("secret-header"));
+        params.request_state = result.request_state;
+        params.input_responses = Some(InputResponses::from([(
+            "uploads".to_owned(),
+            json!({
+                "resultType": "complete", "files": [{"fileId": "f-1", "status": "completed"}]
+            }),
+        )]));
+        let CallToolResponse::Complete(result) = client.call_tool_once(params).await? else {
+            anyhow::bail!("expected a final result")
+        };
+        assert_eq!(result.content[0].as_text().unwrap().text, "saved");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn extension_input_is_never_automatically_fulfilled() -> anyhow::Result<()> {
+    let server = MrtrServer::default();
+    let calls = server.calls.clone();
+    with_pair(server, ProtocolVersion::V_2026_07_28, |client| async move {
+        let err = client
+            .call_tool(CallToolRequestParams::new("file_upload"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::ExtensionInputRequiresHandler));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    })
+    .await
+}
+
+#[test]
+fn extension_input_never_captures_core_methods() {
+    for method in [
+        "ping",
+        "tools/call",
+        "unknown",
+        "elicitation/create",
+        "sampling/createMessage",
+    ] {
+        let json = json!({ "method": method, "params": { "unexpected": true } });
+        assert!(
+            serde_json::from_value::<InputRequest>(json).is_err(),
+            "{method}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

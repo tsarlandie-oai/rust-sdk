@@ -91,6 +91,9 @@ pub enum ServiceError {
     Cancelled { reason: Option<String> },
     #[error("request timeout after {}", chrono::Duration::from_std(*timeout).unwrap_or_default())]
     Timeout { timeout: Duration },
+    /// A high-level MRTR helper received an extension-defined input request.
+    #[error("extension-defined input requires a host handler using the *_once API")]
+    ExtensionInputRequiresHandler,
     /// The peer kept returning `input_required` beyond the configured round cap.
     #[error("input_required did not complete within {max_rounds} MRTR rounds")]
     InputRequiredRoundsExceeded { max_rounds: usize },

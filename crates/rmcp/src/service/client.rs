@@ -2188,6 +2188,9 @@ where
                     _ => return Err(ServiceError::UnexpectedResponse),
                 }
             }
+            // Extension fulfillment requires the host to check negotiation and
+            // bind local data to this particular call. Never auto-dispatch it.
+            InputRequest::Custom(_) => return Err(ServiceError::ExtensionInputRequiresHandler),
         };
         Ok((key, response))
     }

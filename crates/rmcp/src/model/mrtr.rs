@@ -36,14 +36,14 @@
 //!
 //! A complete runnable walkthrough lives in the `servers_mrtr` example.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
     CallToolResult, CreateMessageRequest, CreateTaskResult, ElicitRequest, GetPromptResult,
-    ListRootsRequest, MetaObject, ReadResourceResult, ResultType, ServerResult,
+    JsonObject, ListRootsRequest, MetaObject, ReadResourceResult, ResultType, ServerResult,
 };
 
 /// Default maximum number of MRTR rounds a high-level client call will drive.
@@ -54,11 +54,9 @@ pub const DEFAULT_MRTR_MAX_ROUNDS: usize = 10;
 
 /// A server-initiated request that can appear inside [`InputRequests`].
 ///
-/// Per the MCP spec, only `CreateMessageRequest` (sampling),
-/// `ElicitRequest` (elicitation), and `ListRootsRequest` (roots)
-/// are allowed. This is modeled as an untagged enum rather than a
-/// `ServerRequest` alias to prevent `PingRequest` or `CustomRequest` from
-/// being included.
+/// Core methods are typed. The experimental extension point also accepts
+/// namespaced methods, which a host can handle using the `*_once` API after
+/// checking that the request negotiated the corresponding extension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -70,6 +68,75 @@ pub enum InputRequest {
     Elicitation(ElicitRequest),
     /// A `roots/list` request.
     ListRoots(ListRootsRequest),
+    /// An extension-defined input, such as `io.modelcontextprotocol/files/upload`.
+    Custom(ExtensionInputRequest),
+}
+
+/// Opaque input carried by an MRTR extension. The method is namespaced to
+/// prevent malformed or disallowed core requests from matching this variant.
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
+pub struct ExtensionInputRequest {
+    #[serde(deserialize_with = "deserialize_extension_method")]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(regex(pattern = r"^([A-Za-z0-9-]+\.)+[A-Za-z0-9-]+/\S+$"))
+    )]
+    method: String,
+    /// Extension-defined parameters, including any request metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<JsonObject>,
+}
+
+impl ExtensionInputRequest {
+    /// Construct an input with a dotted namespace, such as `com.example/prompt`.
+    pub fn new(method: String, params: Option<JsonObject>) -> Option<Self> {
+        valid_extension_method(&method).then_some(Self { method, params })
+    }
+
+    /// The extension-specific method discriminator.
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+}
+
+fn valid_extension_method(method: &str) -> bool {
+    let Some((namespace, name)) = method.split_once('/') else {
+        return false;
+    };
+    namespace.contains('.')
+        && namespace.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        && !name.is_empty()
+        && !name.chars().any(char::is_whitespace)
+}
+
+fn deserialize_extension_method<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let method = String::deserialize(deserializer)?;
+    if valid_extension_method(&method) {
+        Ok(method)
+    } else {
+        Err(serde::de::Error::custom(
+            "expected a namespaced extension method",
+        ))
+    }
+}
+
+// An extension payload may contain a signed URL, credentials, or file bytes.
+impl fmt::Debug for ExtensionInputRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtensionInputRequest")
+            .field("method", &self.method)
+            .finish_non_exhaustive()
+    }
 }
 
 // Wire-level equality: two `InputRequest`s are equal if they serialize to the
@@ -87,7 +154,7 @@ impl PartialEq for InputRequest {
 /// A map of server-initiated requests that the client must fulfill.
 ///
 /// Keys are server-assigned string identifiers; values are request objects
-/// (`ElicitRequest`, `CreateMessageRequest`, or `ListRootsRequest`).
+/// (a core request or a namespaced extension input).
 pub type InputRequests = BTreeMap<String, InputRequest>;
 
 /// A map of client responses to server-initiated requests.
