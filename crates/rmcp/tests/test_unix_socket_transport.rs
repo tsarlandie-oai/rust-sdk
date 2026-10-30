@@ -344,8 +344,8 @@ async fn test_unix_socket_request_malformed_json_is_unexpected() -> anyhow::Resu
     match result {
         Err(StreamableHttpError::UnexpectedServerResponse(ref msg)) => {
             assert!(
-                msg.contains("{}"),
-                "expected body preview in error, got: {msg}"
+                msg.contains("2 bytes"),
+                "expected response size in error, got: {msg}"
             );
         }
         other => panic!("expected UnexpectedServerResponse, got: {other:?}"),

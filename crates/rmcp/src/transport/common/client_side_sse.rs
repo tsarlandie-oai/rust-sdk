@@ -427,7 +427,7 @@ where
                                         // non-JSON payloads as message frames. Include last_event_id
                                         // to aid troubleshooting while keeping default behaviour.
                                         let last_id = this.last_event_id.as_deref().unwrap_or("");
-                                        tracing::debug!(last_event_id=%last_id, "failed to deserialize server message: {e}");
+                                        tracing::debug!(last_event_id=%last_id, line = e.line(), column = e.column(), "failed to deserialize server message");
                                         continue;
                                     }
                                     Ok(message) => {

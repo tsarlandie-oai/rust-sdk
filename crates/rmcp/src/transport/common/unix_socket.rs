@@ -280,7 +280,7 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                 return Ok(response);
             }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
+                format!("HTTP {status} ({} bytes)", body.len()),
             )));
         }
 
@@ -332,7 +332,9 @@ impl StreamableHttpClient for UnixSocketHttpClient {
                         ) =>
                     {
                         tracing::warn!(
-                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
+                            line = e.line(),
+                            column = e.column(),
+                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted"
                         );
                         Ok(StreamableHttpPostResponse::Accepted)
                     }

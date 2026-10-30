@@ -1466,7 +1466,7 @@ where
                 }
             };
 
-            tracing::trace!(?evt, "new event");
+            // Raw wire events may include file bytes, signed URLs, and continuation state.
             match evt {
                 Event::SendTaskResult(SendTaskResult::Request { id, result }) => {
                     if let Err(e) = result
@@ -1488,7 +1488,7 @@ where
                     if let Some(param) = cancellation_param
                         && let Some(request_id) = &param.request_id
                             && let Some(responder) = local_responder_pool.remove(request_id) {
-                                tracing::info!(id = %request_id, reason = param.reason, "cancelled");
+                                tracing::info!(id = %request_id, "cancelled");
                                 let _response_result = responder.responder.send(Err(ServiceError::Cancelled {
                                     reason: param.reason.clone(),
                                 }));
@@ -1566,13 +1566,13 @@ where
                     mut request,
                     ..
                 })) => {
-                    tracing::debug!(%id, ?request, "received request");
+                    tracing::debug!(%id, "received request");
                     if let Err(error) = R::enforce_peer_request_association(
                         &request,
                         peer.peer_info().as_deref(),
                         peer_request_association(&request, &local_responder_pool),
                     ) {
-                        tracing::warn!(%id, message = %error.message, "rejected peer request");
+                        tracing::warn!(%id, code = error.code.0, "rejected peer request");
                         // send directly: the sink proxy path would drop the
                         // error since the request was never registered in
                         // local_ct_pool
@@ -1612,11 +1612,11 @@ where
                                 .await;
                             let response = match result {
                                 Ok(result) => {
-                                    tracing::debug!(%id, ?result, "response message");
+                                    tracing::debug!(%id, "response message");
                                     JsonRpcMessage::response(result, id)
                                 }
                                 Err(error) => {
-                                    tracing::warn!(%id, ?error, "response error");
+                                    tracing::warn!(%id, code = error.code.0, "response error");
                                     JsonRpcMessage::error(error, Some(id))
                                 }
                             };
@@ -1628,7 +1628,7 @@ where
                     notification,
                     ..
                 })) => {
-                    tracing::info!(?notification, "received notification");
+                    tracing::info!("received notification");
                     R::invalidate_response_cache(&peer, &notification).await;
                     let subscription_id =
                         if let Some(cancelled) = R::peer_cancelled_params(&notification) {
@@ -1654,7 +1654,7 @@ where
                                 if let Some(request_id) = request_id.as_ref()
                                     && let Some(ct) = local_ct_pool.remove(request_id)
                                 {
-                                    tracing::info!(id = %request_id, reason = cancelled.reason, "cancelled");
+                                    tracing::info!(id = %request_id, "cancelled");
                                     ct.cancel();
                                 }
                                 None
@@ -1717,7 +1717,7 @@ where
                         spawn_service_task(async move {
                             let result = service.handle_notification(notification, context).await;
                             if let Err(error) = result {
-                                tracing::warn!(%error, "Error sending notification");
+                                tracing::warn!(code = error.code.0, "Error sending notification");
                             }
                         }.instrument(current_span));
                     }
@@ -1740,7 +1740,7 @@ where
                     let Some(id) = id else {
                         // MCP error responses without an id (e.g. Parse error / Invalid Request)
                         // can't be routed back to a pending request — log and drop.
-                        tracing::debug!(?error, "received id-less peer error");
+                        tracing::debug!(code = error.code.0, "received id-less peer error");
                         continue;
                     };
                     if let Some(responder) =

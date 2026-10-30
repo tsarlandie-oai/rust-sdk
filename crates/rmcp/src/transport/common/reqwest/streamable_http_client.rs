@@ -301,7 +301,7 @@ impl StreamableHttpClient for reqwest::Client {
                 }
             }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
-                format!("HTTP {status}: {body}"),
+                format!("HTTP {status} ({} bytes)", body.len()),
             )));
         }
         match content_type.as_deref() {
@@ -326,7 +326,9 @@ impl StreamableHttpClient for reqwest::Client {
                         ) =>
                     {
                         tracing::warn!(
-                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
+                            line = e.line(),
+                            column = e.column(),
+                            "could not parse JSON response as ServerJsonRpcMessage, treating as accepted"
                         );
                         Ok(StreamableHttpPostResponse::Accepted)
                     }

@@ -295,13 +295,21 @@ where
                             // if the peer echoes the response back as more invalid data. This
                             // matches the other official MCP SDKs, which ignore unparsable input.
                             // See https://github.com/modelcontextprotocol/rust-sdk/issues/938
-                            tracing::debug!("Ignoring unparsable incoming message: {e}");
+                            tracing::debug!(
+                                line = e.line(),
+                                column = e.column(),
+                                "Ignoring unparsable incoming message"
+                            );
                         }
                         serde_json::error::Category::Data | serde_json::error::Category::Io => {
                             // Well-formed JSON that doesn't match the expected message shape is a
                             // real protocol error rather than unparsable input, so surface it with
                             // an Invalid Request response instead of silently dropping it.
-                            tracing::debug!("Protocol error on incoming message: {e}");
+                            tracing::debug!(
+                                line = e.line(),
+                                column = e.column(),
+                                "Protocol error on incoming message"
+                            );
                             let mut write = self.write.lock().await;
                             let framed = write.as_mut()?;
                             let response = TxJsonRpcMessage::<Role>::error(
@@ -459,10 +467,10 @@ fn try_parse_with_compatibility<T: serde::de::DeserializeOwned>(
                 }
 
                 tracing::debug!(
-                    "Failed to parse message {}: {} | Error: {}",
                     context,
-                    line_str,
-                    e
+                    line = e.line(),
+                    column = e.column(),
+                    "Failed to parse incoming message"
                 );
                 Err(JsonRpcMessageCodecError::Serde(e))
             }

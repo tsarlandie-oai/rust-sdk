@@ -208,7 +208,7 @@ where
                 let ServerNotification::LoggingMessageNotification(logging) =
                     &mut notification.notification
                 else {
-                    tracing::warn!(?notification, "Received unexpected message");
+                    tracing::warn!("Received unexpected notification");
                     continue;
                 };
 
@@ -227,7 +227,10 @@ where
                     .handle_notification(notification.notification, context)
                     .await
                 {
-                    tracing::warn!(?error, "Handle logging before handshake failed.");
+                    tracing::warn!(
+                        code = error.code.0,
+                        "Handle logging before handshake failed."
+                    );
                 }
             }
             // Server could send pings before handshake
@@ -237,7 +240,7 @@ where
                 tracing::trace!("Received ping request. Ignored.")
             }
             // Server SHOULD NOT send any other messages before handshake. We ignore them anyway
-            _ => tracing::warn!(?message, "Received unexpected message"),
+            _ => tracing::warn!("Received unexpected message"),
         }
     }
 }

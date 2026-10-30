@@ -1147,8 +1147,8 @@ impl Worker for LocalSessionWorker {
                         .handle_server_message(message)
                         .await
                         .map_err(LocalSessionWorkerError::FailToHandleMessage);
-                    let _ = responder.send(handle_result).inspect_err(|error| {
-                        tracing::warn!(?error, "failed to send message to http service handler");
+                    let _ = responder.send(handle_result).inspect_err(|_| {
+                        tracing::warn!("failed to send message to http service handler");
                     });
                     if let Some(to_unregister) = to_unregister {
                         self.unregister_resource(&to_unregister);

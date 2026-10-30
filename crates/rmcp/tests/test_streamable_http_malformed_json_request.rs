@@ -124,15 +124,7 @@ async fn call_tool_errors_on_malformed_json_200(#[case] call_body: &'static str)
                 err_msg.contains("unexpected server response"),
                 "expected UnexpectedServerResponse, got: {err_msg}"
             );
-            let preview = if call_body.is_empty() {
-                "<empty>"
-            } else {
-                call_body
-            };
-            assert!(
-                err_msg.contains(preview),
-                "expected body preview {preview:?} in error, got: {err_msg}"
-            );
+            assert!(err_msg.contains(&format!("{} bytes", call_body.len())));
         }
         other => panic!("expected TransportSend(UnexpectedServerResponse), got: {other:?}"),
     }
@@ -162,8 +154,8 @@ async fn post_request_malformed_json_is_unexpected_server_response() {
     match result {
         Err(StreamableHttpError::UnexpectedServerResponse(ref msg)) => {
             assert!(
-                msg.contains("{}"),
-                "expected body preview in error, got: {msg}"
+                msg.contains("2 bytes"),
+                "expected response size in error, got: {msg}"
             );
         }
         other => panic!("expected UnexpectedServerResponse, got: {other:?}"),

@@ -289,7 +289,7 @@ impl From<ReadResourceResponse> for ServerResult {
 /// assert!(result.input_requests.is_none());
 /// assert_eq!(result.request_state.as_deref(), Some("opaque-server-state"));
 /// ```
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
@@ -310,6 +310,17 @@ pub struct InputRequiredResult {
     /// Optional protocol-level metadata.
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<MetaObject>,
+}
+
+impl fmt::Debug for InputRequiredResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InputRequiredResult")
+            .field(
+                "input_count",
+                &self.input_requests.as_ref().map(BTreeMap::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Custom deserializer that requires `resultType: "input_required"` to prevent

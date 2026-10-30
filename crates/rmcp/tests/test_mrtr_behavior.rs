@@ -511,10 +511,30 @@ async fn state_only_input_required_completes() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn extension_input_is_preserved_for_manual_fulfillment() -> anyhow::Result<()> {
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Capture::default();
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
     let server = MrtrServer::default();
     let calls = server.calls.clone();
     with_pair(server, ProtocolVersion::V_2026_07_28, |client| async move {
-        let mut params = CallToolRequestParams::new("file_upload");
+        let mut params = CallToolRequestParams::new("file_upload").with_arguments(
+            JsonObject::from_iter([("file".into(), json!({"data": "INLINE-DATA-SECRET"}))]),
+        );
         let CallToolResponse::InputRequired(result) = client.call_tool_once(params.clone()).await?
         else {
             anyhow::bail!("expected the input_required result")
@@ -545,7 +565,23 @@ async fn extension_input_is_preserved_for_manual_fulfillment() -> anyhow::Result
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         Ok(())
     })
-    .await
+    .await?;
+    let trace = String::from_utf8(output.0.lock().unwrap().clone())?;
+    assert!(
+        trace.contains("received request"),
+        "expected active TRACE diagnostics"
+    );
+    for secret in [
+        "INLINE-DATA-SECRET",
+        "sig=sensitive",
+        "secret-header",
+        "st.ate/with",
+    ] {
+        assert!(!trace.contains(secret), "wire payload leaked in diagnostic");
+    }
+    let fallback = ServerResult::CustomResult(CustomResult(json!({"requestState": TRICKY_STATE})));
+    assert!(!format!("{fallback:?}").contains("st.ate/with"));
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

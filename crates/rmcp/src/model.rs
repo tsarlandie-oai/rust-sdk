@@ -1078,11 +1078,18 @@ impl std::fmt::Display for ResultType {
 }
 
 /// A catch-all response either side can use for custom requests.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(transparent)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[expect(clippy::exhaustive_structs, reason = "intentionally exhaustive")]
 pub struct CustomResult(pub Value);
+
+// Unknown results can wrap extension-defined credentials or continuation state.
+impl std::fmt::Debug for CustomResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomResult").finish_non_exhaustive()
+    }
+}
 
 impl CustomResult {
     pub fn new(result: Value) -> Self {
@@ -4391,7 +4398,7 @@ const_string!(CallToolRequestMethod = "tools/call");
 ///
 /// Contains the tool name and optional arguments needed to execute
 /// the tool operation.
-#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
@@ -4412,6 +4419,15 @@ pub struct CallToolRequestParams {
     /// Clients MUST return this value exactly as received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_state: Option<String>,
+}
+
+// Arguments may include file bytes and request_state may be a bearer credential.
+impl std::fmt::Debug for CallToolRequestParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallToolRequestParams")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CallToolRequestParams {

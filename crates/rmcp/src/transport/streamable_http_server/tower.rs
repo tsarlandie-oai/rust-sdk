@@ -1481,7 +1481,7 @@ where
                 let Some(message) = message else {
                     break;
                 };
-                tracing::trace!(?message);
+                tracing::trace!("sending MCP response");
                 if let Err(error) = persist_and_forward_event(
                     event_store.as_ref(),
                     &stream_id,
@@ -1517,7 +1517,7 @@ where
             let stream = futures::stream::iter(first)
                 .chain(ReceiverStream::new(receiver))
                 .map(|message| {
-                    tracing::trace!(?message);
+                    tracing::trace!("sending MCP response");
                     ServerSseMessage::from_message(message)
                 });
             sse_stream_response(
@@ -2337,7 +2337,7 @@ where
                             )
                             .into());
                         };
-                        tracing::trace!(?message);
+                        tracing::trace!("sending MCP response");
                         if matches!(
                             message,
                             ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
